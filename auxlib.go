@@ -44,6 +44,14 @@ func (ls *LState) CheckNumber(n int) LNumber {
 	return 0
 }
 
+func (ls *LState) EnsureNumber(n int) LNumber {
+	v := ls.Get(n)
+	if lv, ok := v.(LNumber); ok {
+		return lv
+	}
+	return LVAsNumber(v)
+}
+
 func (ls *LState) CheckString(n int) string {
 	v := ls.Get(n)
 	if lv, ok := v.(LString); ok {
