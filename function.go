@@ -3,6 +3,7 @@ package lua
 import (
 	"fmt"
 	"strings"
+	"unsafe"
 )
 
 const (
@@ -152,7 +153,13 @@ func (fp *FunctionProto) str(level int, count int) string {
 
 /* LFunction {{{ */
 
-func newLFunctionL(proto *FunctionProto, env *LTable, nupvalue int) *LFunction {
+// newLFunctionL creates a new Lua function with memory tracking.
+func (ls *LState) newLFunctionL(proto *FunctionProto, env *LTable, nupvalue int) *LFunction {
+	// Calculate memory: base struct + upvalues slice
+	size := int64(unsafe.Sizeof(LFunction{})) + int64(nupvalue)*8
+
+	ls.TrackAlloc(size)
+
 	return &LFunction{
 		IsG: false,
 		Env: env,
@@ -163,7 +170,13 @@ func newLFunctionL(proto *FunctionProto, env *LTable, nupvalue int) *LFunction {
 	}
 }
 
-func newLFunctionG(gfunc LGFunction, env *LTable, nupvalue int) *LFunction {
+// newLFunctionG creates a new Go function with memory tracking.
+func (ls *LState) newLFunctionG(gfunc LGFunction, env *LTable, nupvalue int) *LFunction {
+	// Calculate memory: base struct + upvalues slice
+	size := int64(unsafe.Sizeof(LFunction{})) + int64(nupvalue)*8
+
+	ls.TrackAlloc(size)
+
 	return &LFunction{
 		IsG: true,
 		Env: env,

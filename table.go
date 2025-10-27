@@ -1,5 +1,7 @@
 package lua
 
+import "unsafe"
+
 const defaultArrayCap = 32
 const defaultHashCap = 32
 
@@ -28,6 +30,47 @@ func (lv lValueArraySorter) Less(i, j int) bool {
 	return lessThan(lv.L, lv.Values[i], lv.Values[j])
 }
 
+// newLTable creates a new table with memory tracking.
+// acap is the array capacity hint, hcap is the hash capacity hint.
+func (ls *LState) newLTable(acap int, hcap int) *LTable {
+	if acap < 0 {
+		acap = 0
+	}
+	if hcap < 0 {
+		hcap = 0
+	}
+
+	// Calculate memory allocation size
+	// Base struct + array slice + hash map
+	size := int64(unsafe.Sizeof(LTable{}))
+	if acap != 0 {
+		// LValue is an interface: 16 bytes (2 pointers) on 64-bit
+		size += int64(acap) * 16
+	}
+	if hcap != 0 {
+		// Map overhead: approximately 48 bytes per entry for string -> LValue map
+		size += int64(hcap) * 48
+	}
+
+	// Track allocation before creating the table
+	ls.TrackAlloc(size)
+
+	tb := &LTable{}
+	tb.Metatable = LNil
+	tb.ls = ls
+	tb.allocBytes = size
+
+	if acap != 0 {
+		tb.array = make([]LValue, 0, acap)
+	}
+	if hcap != 0 {
+		tb.strdict = make(map[string]LValue, hcap)
+	}
+	return tb
+}
+
+// newLTable creates a table without memory tracking.
+// Used only for internal registry tables created during LState initialization.
 func newLTable(acap int, hcap int) *LTable {
 	if acap < 0 {
 		acap = 0
@@ -44,6 +87,16 @@ func newLTable(acap int, hcap int) *LTable {
 		tb.strdict = make(map[string]LValue, hcap)
 	}
 	return tb
+}
+
+// trackGrowth tracks memory allocation for table growth.
+// Raises a Lua error if the allocation would exceed the memory limit.
+func (tb *LTable) trackGrowth(additionalBytes int64) {
+	if tb.ls == nil {
+		return // No tracking if not associated with LState
+	}
+	tb.ls.TrackAlloc(additionalBytes)
+	tb.allocBytes += additionalBytes
 }
 
 // Len returns length of this LTable without using __len.
@@ -68,9 +121,19 @@ func (tb *LTable) Append(value LValue) {
 		return
 	}
 	if tb.array == nil {
+		tb.trackGrowth(int64(defaultArrayCap) * 16)
 		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
 	if len(tb.array) == 0 || tb.array[len(tb.array)-1] != LNil {
+		// Track growth if append will exceed capacity
+		if len(tb.array) >= cap(tb.array) {
+			newCap := cap(tb.array) * 2
+			if newCap == 0 {
+				newCap = 1
+			}
+			additionalBytes := int64(newCap-cap(tb.array)) * 16
+			tb.trackGrowth(additionalBytes)
+		}
 		tb.array = append(tb.array, value)
 	} else {
 		i := len(tb.array) - 2
@@ -86,6 +149,7 @@ func (tb *LTable) Append(value LValue) {
 // Insert inserts a given LValue at position `i` in this table.
 func (tb *LTable) Insert(i int, value LValue) {
 	if tb.array == nil {
+		tb.trackGrowth(int64(defaultArrayCap) * 16)
 		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
 	if i > len(tb.array) {
@@ -97,6 +161,15 @@ func (tb *LTable) Insert(i int, value LValue) {
 		return
 	}
 	i -= 1
+	// Track growth if append will exceed capacity
+	if len(tb.array) >= cap(tb.array) {
+		newCap := cap(tb.array) * 2
+		if newCap == 0 {
+			newCap = 1
+		}
+		additionalBytes := int64(newCap-cap(tb.array)) * 16
+		tb.trackGrowth(additionalBytes)
+	}
 	tb.array = append(tb.array, LNil)
 	copy(tb.array[i+1:], tb.array[i:])
 	tb.array[i] = value
@@ -149,14 +222,36 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 	case LNumber:
 		if isArrayKey(v) {
 			if tb.array == nil {
+				tb.trackGrowth(int64(defaultArrayCap) * 16)
 				tb.array = make([]LValue, 0, defaultArrayCap)
 			}
 			index := int(v) - 1
 			alen := len(tb.array)
 			switch {
 			case index == alen:
+				// Track growth if append will exceed capacity
+				if len(tb.array) >= cap(tb.array) {
+					newCap := cap(tb.array) * 2
+					if newCap == 0 {
+						newCap = 1
+					}
+					additionalBytes := int64(newCap-cap(tb.array)) * 16
+					tb.trackGrowth(additionalBytes)
+				}
 				tb.array = append(tb.array, value)
 			case index > alen:
+				neededLen := index + 1
+				if neededLen > cap(tb.array) {
+					newCap := cap(tb.array)
+					if newCap == 0 {
+						newCap = 1
+					}
+					for newCap < neededLen {
+						newCap *= 2
+					}
+					additionalBytes := int64(newCap-cap(tb.array)) * 16
+					tb.trackGrowth(additionalBytes)
+				}
 				for i := 0; i < (index - alen); i++ {
 					tb.array = append(tb.array, LNil)
 				}
@@ -181,14 +276,36 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 		return
 	}
 	if tb.array == nil {
+		tb.trackGrowth(int64(32) * 16)
 		tb.array = make([]LValue, 0, 32)
 	}
 	index := key - 1
 	alen := len(tb.array)
 	switch {
 	case index == alen:
+		// Track growth if append will exceed capacity
+		if len(tb.array) >= cap(tb.array) {
+			newCap := cap(tb.array) * 2
+			if newCap == 0 {
+				newCap = 1
+			}
+			additionalBytes := int64(newCap-cap(tb.array)) * 16
+			tb.trackGrowth(additionalBytes)
+		}
 		tb.array = append(tb.array, value)
 	case index > alen:
+		neededLen := index + 1
+		if neededLen > cap(tb.array) {
+			newCap := cap(tb.array)
+			if newCap == 0 {
+				newCap = 1
+			}
+			for newCap < neededLen {
+				newCap *= 2
+			}
+			additionalBytes := int64(newCap-cap(tb.array)) * 16
+			tb.trackGrowth(additionalBytes)
+		}
 		for i := 0; i < (index - alen); i++ {
 			tb.array = append(tb.array, LNil)
 		}
@@ -201,9 +318,11 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 // RawSetString sets a given LValue to a given string index without the __newindex metamethod.
 func (tb *LTable) RawSetString(key string, value LValue) {
 	if tb.strdict == nil {
+		tb.trackGrowth(int64(defaultHashCap) * 48)
 		tb.strdict = make(map[string]LValue, defaultHashCap)
 	}
 	if tb.keys == nil {
+		tb.trackGrowth(int64(defaultHashCap) * 24) // keys array + k2i map overhead
 		tb.keys = []LValue{}
 		tb.k2i = map[LValue]int{}
 	}
@@ -228,9 +347,15 @@ func (tb *LTable) RawSetH(key LValue, value LValue) {
 		return
 	}
 	if tb.dict == nil {
-		tb.dict = make(map[LValue]LValue, len(tb.strdict))
+		dictCap := len(tb.strdict)
+		if dictCap == 0 {
+			dictCap = defaultHashCap
+		}
+		tb.trackGrowth(int64(dictCap) * 48)
+		tb.dict = make(map[LValue]LValue, dictCap)
 	}
 	if tb.keys == nil {
+		tb.trackGrowth(int64(defaultHashCap) * 24) // keys array + k2i map overhead
 		tb.keys = []LValue{}
 		tb.k2i = map[LValue]int{}
 	}

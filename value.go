@@ -148,6 +148,10 @@ type LTable struct {
 	strdict map[string]LValue
 	keys    []LValue
 	k2i     map[LValue]int
+
+	// Memory tracking
+	ls         *LState
+	allocBytes int64
 }
 
 func (tb *LTable) String() string   { return fmt.Sprintf("table: %p", tb) }
@@ -195,6 +199,10 @@ type LState struct {
 	mainLoop     func(*LState, *callFrame)
 	ctx          context.Context
 	ctxCancelFn  context.CancelFunc
+
+	// Memory tracking
+	allocatedBytes int64
+	maxBytes       int64
 }
 
 func (ls *LState) String() string   { return fmt.Sprintf("thread: %p", ls) }
