@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/yuin/gopher-lua/parse"
 )
@@ -398,6 +399,15 @@ func (rg *registry) resize(requiredSize int) { // +inline-start
 } // +inline-end
 
 func (rg *registry) forceResize(newSize int) {
+	// Track memory growth for registry resize
+	oldSize := len(rg.array)
+	if newSize > oldSize {
+		additionalBytes := int64(newSize-oldSize) * 16 // LValue is 16 bytes
+		if ls, ok := rg.handler.(*LState); ok {
+			ls.TrackAlloc(additionalBytes)
+		}
+	}
+
 	newSlice := make([]LValue, newSize)
 	copy(newSlice, rg.array[:rg.top]) // should we copy the area beyond top? there shouldn't be any valid values there so it shouldn't be necessary.
 	rg.array = newSlice
@@ -688,6 +698,42 @@ func newLState(options Options) *LState {
 	ls.Env = ls.G.Global
 	return ls
 }
+
+/* Memory tracking {{{ */
+
+// TrackAlloc adds bytes to the memory allocation counter and checks against the limit.
+// Raises a Lua error if the allocation would exceed the memory limit.
+func (ls *LState) TrackAlloc(bytes int64) {
+	ls.allocatedBytes += bytes
+
+	// Only check limit if one is set
+	if ls.maxBytes > 0 && ls.allocatedBytes > ls.maxBytes {
+		ls.RaiseError("memory limit exceeded: %d bytes allocated, limit is %d bytes",
+			ls.allocatedBytes, ls.maxBytes)
+	}
+}
+
+// ResetMemoryUsage resets the allocated bytes counter to zero.
+func (ls *LState) ResetMemoryUsage() {
+	ls.allocatedBytes = 0
+}
+
+// SetMemoryLimit sets the maximum memory limit in bytes. Set to 0 to disable limiting.
+func (ls *LState) SetMemoryLimit(maxBytes int64) {
+	ls.maxBytes = maxBytes
+}
+
+// GetAllocatedBytes returns the current number of tracked allocated bytes.
+func (ls *LState) GetAllocatedBytes() int64 {
+	return ls.allocatedBytes
+}
+
+// GetMemoryLimit returns the current memory limit in bytes (0 if no limit).
+func (ls *LState) GetMemoryLimit() int64 {
+	return ls.maxBytes
+}
+
+/* }}} */
 
 func (ls *LState) printReg() {
 	println("-------------------------")
@@ -1111,7 +1157,7 @@ func (ls *LState) initCallFrame(cf *callFrame) { // +inline-start
 			if CompatVarArg {
 				ls.reg.SetTop(cf.LocalBase + nargs + np + 1)
 				if (proto.IsVarArg & VarArgNeedsArg) != 0 {
-					argtb := newLTable(nvarargs, 0)
+					argtb := ls.newLTable(nvarargs, 0)
 					for i := 0; i < nvarargs; i++ {
 						argtb.RawSetInt(i+1, ls.reg.Get(cf.LocalBase+np+i))
 					}
@@ -1223,7 +1269,7 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 				if CompatVarArg {
 					ls.reg.SetTop(cf.LocalBase + nargs + np + 1)
 					if (proto.IsVarArg & VarArgNeedsArg) != 0 {
-						argtb := newLTable(nvarargs, 0)
+						argtb := ls.newLTable(nvarargs, 0)
 						for i := 0; i < nvarargs; i++ {
 							argtb.RawSetInt(i+1, ls.reg.Get(cf.LocalBase+np+i))
 						}
@@ -1546,7 +1592,6 @@ func (ls *LState) Get(idx int) LValue {
 			return LNil
 		}
 	}
-	return LNil
 }
 
 func (ls *LState) Push(value LValue) {
@@ -1602,11 +1647,11 @@ func (ls *LState) Remove(index int) {
 /* object allocation {{{ */
 
 func (ls *LState) NewTable() *LTable {
-	return newLTable(defaultArrayCap, defaultHashCap)
+	return ls.newLTable(defaultArrayCap, defaultHashCap)
 }
 
 func (ls *LState) CreateTable(acap, hcap int) *LTable {
-	return newLTable(acap, hcap)
+	return ls.newLTable(acap, hcap)
 }
 
 // NewThread returns a new LState that shares with the original state all global objects.
@@ -1625,10 +1670,13 @@ func (ls *LState) NewThread() (*LState, context.CancelFunc) {
 }
 
 func (ls *LState) NewFunctionFromProto(proto *FunctionProto) *LFunction {
-	return newLFunctionL(proto, ls.Env, int(proto.NumUpvalues))
+	return ls.newLFunctionL(proto, ls.Env, int(proto.NumUpvalues))
 }
 
 func (ls *LState) NewUserData() *LUserData {
+	size := int64(unsafe.Sizeof(LUserData{}))
+	ls.TrackAlloc(size)
+
 	return &LUserData{
 		Env:       ls.currentEnv(),
 		Metatable: LNil,
@@ -1636,11 +1684,11 @@ func (ls *LState) NewUserData() *LUserData {
 }
 
 func (ls *LState) NewFunction(fn LGFunction) *LFunction {
-	return newLFunctionG(fn, ls.currentEnv(), 0)
+	return ls.newLFunctionG(fn, ls.currentEnv(), 0)
 }
 
 func (ls *LState) NewClosure(fn LGFunction, upvalues ...LValue) *LFunction {
-	cl := newLFunctionG(fn, ls.currentEnv(), len(upvalues))
+	cl := ls.newLFunctionG(fn, ls.currentEnv(), len(upvalues))
 	for i, lv := range upvalues {
 		cl.Upvalues[i] = &Upvalue{}
 		cl.Upvalues[i].Close()
@@ -2019,7 +2067,7 @@ func (ls *LState) Load(reader io.Reader, name string) (*LFunction, error) {
 	if err != nil {
 		return nil, newApiErrorE(ApiErrorSyntax, err)
 	}
-	return newLFunctionL(proto, ls.currentEnv(), 0), nil
+	return ls.newLFunctionL(proto, ls.currentEnv(), 0), nil
 }
 
 func (ls *LState) Call(nargs, nret int) {
@@ -2095,7 +2143,7 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 }
 
 func (ls *LState) GPCall(fn LGFunction, data LValue) error {
-	ls.Push(newLFunctionG(fn, ls.currentEnv(), 0))
+	ls.Push(ls.newLFunctionG(fn, ls.currentEnv(), 0))
 	ls.Push(data)
 	return ls.PCall(1, MultRet, nil)
 }
