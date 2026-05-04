@@ -152,6 +152,7 @@ type LTable struct {
 	// Memory tracking
 	ls         *LState
 	allocBytes int64
+	readonly   bool
 }
 
 func (tb *LTable) String() string   { return fmt.Sprintf("table: %p", tb) }
@@ -188,17 +189,18 @@ type LState struct {
 	Dead    bool
 	Options Options
 
-	stop         int32
-	reg          *registry
-	stack        callFrameStack
-	alloc        *allocator
-	currentFrame *callFrame
-	wrapped      bool
-	uvcache      *Upvalue
-	hasErrorFunc bool
-	mainLoop     func(*LState, *callFrame)
-	ctx          context.Context
-	ctxCancelFn  context.CancelFunc
+	stop           int32
+	reg            *registry
+	stack          callFrameStack
+	alloc          *allocator
+	currentFrame   *callFrame
+	wrapped        bool
+	uvcache        *Upvalue
+	hasErrorFunc   bool
+	mainLoop       func(*LState, *callFrame)
+	ctx            context.Context
+	ctxCancelFn    context.CancelFunc
+	readonlyBypass int
 
 	// Memory tracking
 	allocatedBytes int64

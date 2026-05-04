@@ -21,6 +21,7 @@ var tableFuncs = map[string]LGFunction{
 
 func tableSort(L *LState) int {
 	tbl := L.CheckTable(1)
+	L.checkTableWritable(tbl)
 	sorter := lValueArraySorter{L, nil, tbl.array}
 	if L.GetTop() != 1 {
 		sorter.Fn = L.CheckFunction(2)
@@ -41,10 +42,11 @@ func tableMaxN(L *LState) int {
 
 func tableRemove(L *LState) int {
 	tbl := L.CheckTable(1)
+	L.checkTableWritable(tbl)
 	if L.GetTop() == 1 {
-		L.Push(tbl.Remove(-1))
+		L.Push(tbl.remove(-1))
 	} else {
-		L.Push(tbl.Remove(L.CheckInt(2)))
+		L.Push(tbl.remove(L.CheckInt(2)))
 	}
 	return 1
 }
@@ -88,12 +90,13 @@ func tableInsert(L *LState) int {
 	if nargs == 1 {
 		L.RaiseError("wrong number of arguments")
 	}
+	L.checkTableWritable(tbl)
 
 	if L.GetTop() == 2 {
-		tbl.Append(L.Get(2))
+		tbl.append(L.Get(2))
 		return 0
 	}
-	tbl.Insert(int(L.CheckInt(2)), L.CheckAny(3))
+	tbl.insert(int(L.CheckInt(2)), L.CheckAny(3))
 	return 0
 }
 

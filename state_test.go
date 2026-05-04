@@ -76,6 +76,252 @@ func TestSkipOpenLibs(t *testing.T) {
 	errorIfScriptFail(t, L2, `print("")`)
 }
 
+func TestReadOnlyTable(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	tbl := L.NewTable()
+	tbl.RawSetString("x", LNumber(1))
+	tbl.RawSetInt(1, LNumber(3))
+	tbl.RawSetInt(2, LNumber(2))
+	L.SetGlobal("readonly", tbl)
+	L.SetTableReadOnly(tbl, true)
+	errorIfNotEqual(t, true, L.IsTableReadOnly(tbl))
+
+	errorIfScriptNotFail(t, L, `readonly.x = 2`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `readonly.y = 2`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `rawset(readonly, "x", 2)`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `table.insert(readonly, 4)`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `table.remove(readonly)`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `table.sort(readonly)`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `setmetatable(readonly, {})`, readonlyTableError)
+	errorIfScriptNotFail(t, L, `debug.setmetatable(readonly, {})`, readonlyTableError)
+
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		L.RawSet(tbl, LString("x"), LNumber(2))
+		return 0
+	}, readonlyTableError)
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		L.RawSetInt(tbl, 1, LNumber(2))
+		return 0
+	}, readonlyTableError)
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		tbl.RawSetString("x", LNumber(2))
+		return 0
+	}, readonlyTableError)
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		tbl.RawSetInt(1, LNumber(2))
+		return 0
+	}, readonlyTableError)
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		tbl.RawSetH(LString("x"), LNumber(2))
+		return 0
+	}, readonlyTableError)
+
+	L.WithTableReadOnlyBypass(func() {
+		L.RawSet(tbl, LString("x"), LNumber(2))
+		tbl.RawSetString("y", LNumber(3))
+		tbl.Insert(1, LNumber(4))
+		tbl.Remove(1)
+		L.SetMetatable(tbl, L.NewTable())
+	})
+	errorIfNotEqual(t, LNumber(2), tbl.RawGetString("x"))
+	errorIfNotEqual(t, LNumber(3), tbl.RawGetString("y"))
+
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		tbl.RawSetString("z", LNumber(4))
+		return 0
+	}, readonlyTableError)
+
+	errorIfScriptFail(t, L, `
+		local t = {}
+		t.x = 1
+		rawset(t, "y", 2)
+		table.insert(t, 3)
+		table.remove(t)
+		table.sort({3, 2, 1})
+		setmetatable(t, {__index = {ok = true}})
+		assert(t.x == 1 and t.y == 2 and t.ok)
+	`)
+}
+
+func TestReadOnlyTableSetList(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	tbl := L.NewTable()
+	L.SetGlobal("readonly", tbl)
+	L.SetTableReadOnly(tbl, true)
+
+	proto := &FunctionProto{
+		SourceName:       "setlist-readonly-test",
+		NumUsedRegisters: 3,
+		Code: []uint32{
+			opCreateABx(OP_GETGLOBAL, 0, 0),
+			opCreateABx(OP_LOADK, 1, 0),
+			opCreateABx(OP_LOADK, 2, 1),
+			opCreateABC(OP_SETLIST, 0, 2, 1),
+			opCreateABC(OP_RETURN, 0, 1, 0),
+		},
+		Constants:          []LValue{LNumber(1), LNumber(2)},
+		DbgSourcePositions: []int{1, 1, 1, 1, 1},
+		stringConstants:    []string{"readonly"},
+	}
+
+	L.Push(L.NewFunctionFromProto(proto))
+	err := L.PCall(0, 0, nil)
+	errorIfNil(t, err)
+	errorIfFalse(t, strings.Contains(err.Error(), readonlyTableError), "expected readonly error, got %v", err)
+	errorIfNotEqual(t, LNil, tbl.RawGetInt(1))
+	errorIfNotEqual(t, LNil, tbl.RawGetInt(2))
+}
+
+// Readonly must trump __newindex: writes that would otherwise be redirected
+// into the readonly table by a metatable chain still error out.
+func TestReadOnlyTableNewIndexBypass(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	tbl := L.NewTable()
+	tbl.RawSetString("existing", LNumber(1))
+	L.SetGlobal("readonly", tbl)
+	L.SetTableReadOnly(tbl, true)
+
+	// Writing a missing key should still hit the readonly check, not fall
+	// through to a __newindex hook even if one were attached.
+	errorIfScriptNotFail(t, L, `readonly.missing = 1`, readonlyTableError)
+
+	// A writable proxy whose __newindex points at the readonly table must
+	// not let scripts smuggle writes through. setField walks the metatable
+	// chain and re-checks readonly on each step.
+	errorIfScriptNotFail(t, L, `
+		local proxy = setmetatable({}, {__newindex = readonly})
+		proxy.x = 99
+	`, readonlyTableError)
+
+	// __index reads through readonly are fine; only writes are gated.
+	errorIfScriptFail(t, L, `
+		local view = setmetatable({}, {__index = readonly})
+		assert(view.existing == 1)
+	`)
+}
+
+// The bypass uses a counter so nested scopes compose correctly: leaving the
+// inner scope must not re-enable enforcement while the outer scope is active.
+func TestReadOnlyTableNestedBypass(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	tbl := L.NewTable()
+	L.SetTableReadOnly(tbl, true)
+
+	L.WithTableReadOnlyBypass(func() {
+		tbl.RawSetString("a", LNumber(1))
+		L.WithTableReadOnlyBypass(func() {
+			tbl.RawSetString("b", LNumber(2))
+		})
+		// Inner scope returned; outer bypass must still apply.
+		tbl.RawSetString("c", LNumber(3))
+	})
+	errorIfNotEqual(t, LNumber(1), tbl.RawGetString("a"))
+	errorIfNotEqual(t, LNumber(2), tbl.RawGetString("b"))
+	errorIfNotEqual(t, LNumber(3), tbl.RawGetString("c"))
+
+	// Outer scope returned; enforcement is back on.
+	errorIfGFuncNotFail(t, L, func(L *LState) int {
+		tbl.RawSetString("d", LNumber(4))
+		return 0
+	}, readonlyTableError)
+}
+
+// Read paths must remain unaffected by the readonly flag — pairs/ipairs/#/
+// rawget/table.concat/table.maxn are all canaries against future regressions.
+func TestReadOnlyTableReadOps(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	tbl := L.NewTable()
+	tbl.RawSetInt(1, LString("a"))
+	tbl.RawSetInt(2, LString("b"))
+	tbl.RawSetInt(3, LString("c"))
+	tbl.RawSetString("name", LString("redis"))
+	L.SetGlobal("readonly", tbl)
+	L.SetTableReadOnly(tbl, true)
+
+	errorIfScriptFail(t, L, `
+		assert(#readonly == 3)
+		assert(rawget(readonly, "name") == "redis")
+		assert(table.concat(readonly, ",") == "a,b,c")
+		assert(table.maxn(readonly) == 3)
+
+		local seen = 0
+		for i, v in ipairs(readonly) do seen = seen + 1 end
+		assert(seen == 3)
+
+		local keys = 0
+		for k, v in pairs(readonly) do keys = keys + 1 end
+		assert(keys == 4)
+
+		assert(getmetatable(readonly) == nil)
+	`)
+}
+
+// A bypass on the parent LState must not leak into a child coroutine: scripts
+// that try to write to a readonly table from inside a coroutine still fail,
+// even if the embedder wrapped the resume in WithTableReadOnlyBypass.
+func TestReadOnlyTableCoroutineNoLeak(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	tbl := L.NewTable()
+	L.SetGlobal("readonly", tbl)
+	L.SetTableReadOnly(tbl, true)
+
+	// Sanity: without bypass, the coroutine errors as expected.
+	errorIfScriptFail(t, L, `
+		local co = coroutine.create(function()
+			readonly.x = 1
+		end)
+		local ok, err = coroutine.resume(co)
+		assert(not ok, "coroutine should have failed")
+		assert(string.find(err, "readonly"), "expected readonly error, got "..tostring(err))
+	`)
+
+	// With bypass on the parent, a coroutine still cannot write — its
+	// executing LState has its own bypass counter at zero.
+	L.WithTableReadOnlyBypass(func() {
+		errorIfScriptFail(t, L, `
+			local co = coroutine.create(function()
+				readonly.x = 1
+			end)
+			local ok, err = coroutine.resume(co)
+			assert(not ok, "coroutine should have failed even under parent bypass")
+			assert(string.find(err, "readonly"), "expected readonly error, got "..tostring(err))
+		`)
+	})
+
+	L.WithTableReadOnlyBypass(func() {
+		errorIfScriptFail(t, L, `
+			local ops = {
+				function() rawset(readonly, "raw", 1) end,
+				function() table.insert(readonly, 1) end,
+				function() table.remove(readonly) end,
+				function() table.sort(readonly) end,
+			}
+			for _, op in ipairs(ops) do
+				local co = coroutine.create(op)
+				local ok, err = coroutine.resume(co)
+				assert(not ok, "coroutine should have failed even under parent bypass")
+				assert(string.find(err, "readonly"), "expected readonly error, got "..tostring(err))
+			end
+		`)
+	})
+
+	errorIfNotEqual(t, LNil, tbl.RawGetString("x"))
+	errorIfNotEqual(t, LNil, tbl.RawGetString("raw"))
+	errorIfNotEqual(t, LNil, tbl.RawGetInt(1))
+}
+
 func TestGetAndReplace(t *testing.T) {
 	L := NewState()
 	defer L.Close()

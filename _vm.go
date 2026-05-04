@@ -763,12 +763,13 @@ func init() {
 			}
 			offset := (C - 1) * FieldsPerFlush
 			table := reg.Get(RA).(*LTable)
+			L.checkTableWritable(table)
 			nelem := B
 			if B == 0 {
 				nelem = reg.Top() - RA - 1
 			}
 			for i := 1; i <= nelem; i++ {
-				table.RawSetInt(offset+i, reg.Get(RA+i))
+				table.rawSetInt(offset+i, reg.Get(RA+i))
 			}
 			return 0
 		},

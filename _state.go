@@ -1173,6 +1173,7 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue) {
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
+			ls.checkTableWritable(tb)
 			if tb.RawGet(key) != LNil {
 				ls.RawSet(tb, key, value)
 				return
@@ -1205,8 +1206,9 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
+			ls.checkTableWritable(tb)
 			if tb.RawGetString(key) != LNil {
-				tb.RawSetString(key, value)
+				tb.rawSetString(key, value)
 				return
 			}
 		}
@@ -1215,7 +1217,7 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 			if !istable {
 				ls.RaiseError("attempt to index a non-table object(%v) with key '%s'", curobj.Type().String(), key)
 			}
-			tb.RawSetString(key, value)
+			tb.rawSetString(key, value)
 			return
 		}
 		if metaindex.Type() == LTFunction {
@@ -1747,17 +1749,74 @@ func (ls *LState) GetTable(obj LValue, key LValue) LValue {
 	return ls.getField(obj, key)
 }
 
+// SetTableReadOnly toggles the readonly flag on tb. Once readonly, attempts
+// to mutate the table from Lua scripts or the public Go API raise a Lua
+// error. Reads are unaffected. The first call also adopts tb into this
+// LState (used as the bypass owner for direct LTable method calls); a later
+// call from a different LState will not change ownership.
+//
+// Pass readonly=false to make the table writable again. The intended use is
+// to lock down a sandbox-facing table once it has been populated by trusted Go code.
+func (ls *LState) SetTableReadOnly(tb *LTable, readonly bool) {
+	if tb.ls == nil {
+		tb.ls = ls
+	}
+	tb.readonly = readonly
+}
+
+// IsTableReadOnly reports whether tb has been marked readonly via
+// SetTableReadOnly.
+func (ls *LState) IsTableReadOnly(tb *LTable) bool {
+	return tb.readonly
+}
+
+// WithTableReadOnlyBypass runs fn with readonly enforcement disabled on this
+// LState, allowing trusted Go code to mutate tables that scripts cannot.
+//
+// The bypass is tracked by a counter, so nested WithTableReadOnlyBypass
+// calls compose: enforcement is restored only after the outermost scope
+// returns. The counter is decremented via defer, so it unwinds correctly
+// even if fn panics or raises a Lua error.
+//
+// The bypass is scoped to this LState only. Coroutines created from this
+// state run on their own LState and do not inherit the bypass — script-side
+// writes from within a coroutine still error out, which is intentional for
+// sandboxing.
+func (ls *LState) WithTableReadOnlyBypass(fn func()) {
+	ls.readonlyBypass++
+	defer func() {
+		ls.readonlyBypass--
+	}()
+	fn()
+}
+
+// checkTableWritable raises a Lua error if tb is readonly and this LState
+// is not currently inside a WithTableReadOnlyBypass scope. It consults the
+// executing LState's bypass counter and is therefore the right check for
+// VM- and stdlib-driven write paths (OP_SETLIST, table.insert, etc.).
+//
+// Compare with (*LTable).checkWritable, which consults the table's owner
+// LState and is used by the public LTable methods where no executing
+// LState is in scope.
+func (ls *LState) checkTableWritable(tb *LTable) {
+	if tb != nil && tb.readonly && ls.readonlyBypass == 0 {
+		ls.RaiseError(readonlyTableError)
+	}
+}
+
 func (ls *LState) RawSet(tb *LTable, key LValue, value LValue) {
 	if n, ok := key.(LNumber); ok && math.IsNaN(float64(n)) {
 		ls.RaiseError("table index is NaN")
 	} else if key == LNil {
 		ls.RaiseError("table index is nil")
 	}
-	tb.RawSet(key, value)
+	ls.checkTableWritable(tb)
+	tb.rawSet(key, value)
 }
 
 func (ls *LState) RawSetInt(tb *LTable, key int, value LValue) {
-	tb.RawSetInt(key, value)
+	ls.checkTableWritable(tb)
+	tb.rawSetInt(key, value)
 }
 
 func (ls *LState) SetField(obj LValue, key string, value LValue) {
@@ -1965,6 +2024,7 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 
 	switch v := obj.(type) {
 	case *LTable:
+		ls.checkTableWritable(v)
 		v.Metatable = mt
 	case *LUserData:
 		v.Metatable = mt

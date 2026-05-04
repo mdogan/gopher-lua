@@ -4,6 +4,7 @@ import "unsafe"
 
 const defaultArrayCap = 32
 const defaultHashCap = 32
+const readonlyTableError = "Attempt to modify a readonly table"
 
 type lValueArraySorter struct {
 	L      *LState
@@ -99,6 +100,32 @@ func (tb *LTable) trackGrowth(additionalBytes int64) {
 	tb.allocBytes += additionalBytes
 }
 
+// checkWritable raises a Lua error if this table is marked readonly and the
+// table's owner LState is not inside a WithTableReadOnlyBypass scope. It is
+// used by the public LTable mutation methods (RawSet, RawSetString, Insert,
+// etc.) where no executing LState is in scope, so the only bypass counter
+// available is the owner's.
+//
+// Compare with (*LState).checkTableWritable, which consults the executing
+// LState's bypass and is used on the VM- and stdlib-driven write paths.
+//
+// The terminating panic is a defensive guard for tables that were marked
+// readonly without ever being adopted by an LState; under normal use
+// SetTableReadOnly populates tb.ls, so this branch is unreachable.
+func (tb *LTable) checkWritable() {
+	if tb == nil || !tb.readonly {
+		return
+	}
+	if tb.ls != nil && tb.ls.readonlyBypass > 0 {
+		return
+	}
+	if tb.ls != nil {
+		tb.ls.RaiseError(readonlyTableError)
+		return
+	}
+	panic(readonlyTableError)
+}
+
 // Len returns length of this LTable without using __len.
 func (tb *LTable) Len() int {
 	if tb.array == nil {
@@ -117,6 +144,13 @@ func (tb *LTable) Len() int {
 
 // Append appends a given LValue to this LTable.
 func (tb *LTable) Append(value LValue) {
+	tb.checkWritable()
+	tb.append(value)
+}
+
+// append is the readonly-check-free variant of Append. The caller must have
+// already gated on (*LState).checkTableWritable or (*LTable).checkWritable.
+func (tb *LTable) append(value LValue) {
 	if value == LNil {
 		return
 	}
@@ -148,16 +182,23 @@ func (tb *LTable) Append(value LValue) {
 
 // Insert inserts a given LValue at position `i` in this table.
 func (tb *LTable) Insert(i int, value LValue) {
+	tb.checkWritable()
+	tb.insert(i, value)
+}
+
+// insert is the readonly-check-free variant of Insert. The caller must have
+// already gated on (*LState).checkTableWritable or (*LTable).checkWritable.
+func (tb *LTable) insert(i int, value LValue) {
 	if tb.array == nil {
 		tb.trackGrowth(int64(defaultArrayCap) * 16)
 		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
 	if i > len(tb.array) {
-		tb.RawSetInt(i, value)
+		tb.rawSetInt(i, value)
 		return
 	}
 	if i <= 0 {
-		tb.RawSet(LNumber(i), value)
+		tb.rawSet(LNumber(i), value)
 		return
 	}
 	i -= 1
@@ -190,6 +231,13 @@ func (tb *LTable) MaxN() int {
 
 // Remove removes from this table the element at a given position.
 func (tb *LTable) Remove(pos int) LValue {
+	tb.checkWritable()
+	return tb.remove(pos)
+}
+
+// remove is the readonly-check-free variant of Remove. The caller must have
+// already gated on (*LState).checkTableWritable or (*LTable).checkWritable.
+func (tb *LTable) remove(pos int) LValue {
 	if tb.array == nil {
 		return LNil
 	}
@@ -218,6 +266,13 @@ func (tb *LTable) Remove(pos int) LValue {
 // It is recommended to use `RawSetString` or `RawSetInt` for performance
 // if you already know the given LValue is a string or number.
 func (tb *LTable) RawSet(key LValue, value LValue) {
+	tb.checkWritable()
+	tb.rawSet(key, value)
+}
+
+// rawSet is the readonly-check-free variant of RawSet. The caller must have
+// already gated on (*LState).checkTableWritable or (*LTable).checkWritable.
+func (tb *LTable) rawSet(key LValue, value LValue) {
 	switch v := key.(type) {
 	case LNumber:
 		if isArrayKey(v) {
@@ -262,17 +317,25 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 			return
 		}
 	case LString:
-		tb.RawSetString(string(v), value)
+		tb.rawSetString(string(v), value)
 		return
 	}
 
-	tb.RawSetH(key, value)
+	tb.rawSetH(key, value)
 }
 
 // RawSetInt sets a given LValue at a position `key` without the __newindex metamethod.
 func (tb *LTable) RawSetInt(key int, value LValue) {
+	tb.checkWritable()
+	tb.rawSetInt(key, value)
+}
+
+// rawSetInt is the readonly-check-free variant of RawSetInt. The caller
+// must have already gated on (*LState).checkTableWritable or
+// (*LTable).checkWritable.
+func (tb *LTable) rawSetInt(key int, value LValue) {
 	if key < 1 || key >= MaxArrayIndex {
-		tb.RawSetH(LNumber(key), value)
+		tb.rawSetH(LNumber(key), value)
 		return
 	}
 	if tb.array == nil {
@@ -317,6 +380,14 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 
 // RawSetString sets a given LValue to a given string index without the __newindex metamethod.
 func (tb *LTable) RawSetString(key string, value LValue) {
+	tb.checkWritable()
+	tb.rawSetString(key, value)
+}
+
+// rawSetString is the readonly-check-free variant of RawSetString. The
+// caller must have already gated on (*LState).checkTableWritable or
+// (*LTable).checkWritable.
+func (tb *LTable) rawSetString(key string, value LValue) {
 	if tb.strdict == nil {
 		tb.trackGrowth(int64(defaultHashCap) * 48)
 		tb.strdict = make(map[string]LValue, defaultHashCap)
@@ -342,8 +413,16 @@ func (tb *LTable) RawSetString(key string, value LValue) {
 
 // RawSetH sets a given LValue to a given index without the __newindex metamethod.
 func (tb *LTable) RawSetH(key LValue, value LValue) {
+	tb.checkWritable()
+	tb.rawSetH(key, value)
+}
+
+// rawSetH is the readonly-check-free variant of RawSetH. The caller must
+// have already gated on (*LState).checkTableWritable or
+// (*LTable).checkWritable.
+func (tb *LTable) rawSetH(key LValue, value LValue) {
 	if s, ok := key.(LString); ok {
-		tb.RawSetString(string(s), value)
+		tb.rawSetString(string(s), value)
 		return
 	}
 	if tb.dict == nil {
