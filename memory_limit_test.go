@@ -795,3 +795,74 @@ func TestMemoryLimit_RecursiveTable(t *testing.T) {
 		t.Error("Expected non-zero memory allocation for recursive tables")
 	}
 }
+
+func TestTryCreateTable_WithinLimit(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	L.ResetMemoryUsage()
+	L.SetMemoryLimit(10 * 1024)
+
+	tb, ok := L.TryCreateTable(8, 0)
+	if !ok {
+		t.Fatal("Expected TryCreateTable to succeed within the limit")
+	}
+	if tb == nil {
+		t.Fatal("Expected a table")
+	}
+	if L.GetAllocatedBytes() == 0 {
+		t.Error("Expected the successful allocation to be tracked")
+	}
+
+	// Filling up to the requested capacity must not grow the array, so no further
+	// allocation can be charged and nothing can raise.
+	allocated := L.GetAllocatedBytes()
+	for i := 1; i <= 8; i++ {
+		tb.RawSetInt(i, LNumber(i))
+	}
+	if got := L.GetAllocatedBytes(); got != allocated {
+		t.Errorf("Expected filling to capacity to charge nothing, allocated went %d -> %d", allocated, got)
+	}
+}
+
+func TestTryCreateTable_OverLimit(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	L.ResetMemoryUsage()
+	L.SetMemoryLimit(1024)
+
+	tb, ok := L.TryCreateTable(1024*1024, 0)
+	if ok {
+		t.Fatal("Expected TryCreateTable to report failure over the limit")
+	}
+	if tb != nil {
+		t.Error("Expected no table on failure")
+	}
+	if L.GetAllocatedBytes() != 0 {
+		t.Error("Expected a rejected allocation not to be charged")
+	}
+
+	// The whole point: CreateTable raises here, and a raise with no protected frame
+	// on the stack panics instead of unwinding into an error.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("Expected CreateTable to panic over the limit")
+			}
+		}()
+		L.CreateTable(1024*1024, 0)
+	}()
+}
+
+func TestTryCreateTable_NoLimit(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	L.ResetMemoryUsage()
+	L.SetMemoryLimit(0)
+
+	if _, ok := L.TryCreateTable(1024*1024, 0); !ok {
+		t.Fatal("Expected TryCreateTable to succeed when no limit is set")
+	}
+}

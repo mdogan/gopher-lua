@@ -31,17 +31,9 @@ func (lv lValueArraySorter) Less(i, j int) bool {
 	return lessThan(lv.L, lv.Values[i], lv.Values[j])
 }
 
-// newLTable creates a new table with memory tracking.
-// acap is the array capacity hint, hcap is the hash capacity hint.
-func (ls *LState) newLTable(acap int, hcap int) *LTable {
-	if acap < 0 {
-		acap = 0
-	}
-	if hcap < 0 {
-		hcap = 0
-	}
-
-	// Calculate memory allocation size
+// ltableSize returns the number of bytes charged for a table with the given capacities.
+// acap and hcap must already be clamped to non-negative values.
+func ltableSize(acap int, hcap int) int64 {
 	// Base struct + array slice + hash map
 	size := int64(unsafe.Sizeof(LTable{}))
 	if acap != 0 {
@@ -52,6 +44,20 @@ func (ls *LState) newLTable(acap int, hcap int) *LTable {
 		// Map overhead: approximately 48 bytes per entry for string -> LValue map
 		size += int64(hcap) * 48
 	}
+	return size
+}
+
+// newLTable creates a new table with memory tracking.
+// acap is the array capacity hint, hcap is the hash capacity hint.
+func (ls *LState) newLTable(acap int, hcap int) *LTable {
+	if acap < 0 {
+		acap = 0
+	}
+	if hcap < 0 {
+		hcap = 0
+	}
+
+	size := ltableSize(acap, hcap)
 
 	// Track allocation before creating the table
 	ls.TrackAlloc(size)

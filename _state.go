@@ -1443,6 +1443,23 @@ func (ls *LState) CreateTable(acap, hcap int) *LTable {
 	return ls.newLTable(acap, hcap)
 }
 
+// TryCreateTable is CreateTable that reports failure instead of raising when the
+// allocation would exceed the state's memory limit. Callers building a table from Go
+// before entering a protected call must use this: a raise with no protected frame on
+// the stack panics rather than unwinding into an error.
+func (ls *LState) TryCreateTable(acap, hcap int) (*LTable, bool) {
+	if acap < 0 {
+		acap = 0
+	}
+	if hcap < 0 {
+		hcap = 0
+	}
+	if ls.maxBytes > 0 && ls.allocatedBytes+ltableSize(acap, hcap) > ls.maxBytes {
+		return nil, false
+	}
+	return ls.newLTable(acap, hcap), true
+}
+
 // NewThread returns a new LState that shares with the original state all global objects.
 // If the original state has context.Context, the new state has a new child context of the original state and this function returns its cancel function.
 func (ls *LState) NewThread() (*LState, context.CancelFunc) {
