@@ -701,6 +701,13 @@ func newLState(options Options) *LState {
 
 /* Memory tracking {{{ */
 
+func (ls *LState) memoryLimitError(allocatedBytes int64) error {
+	return fmt.Errorf(
+		"memory limit exceeded: %d bytes allocated, limit is %d bytes",
+		allocatedBytes, ls.maxBytes,
+	)
+}
+
 // TrackAlloc adds bytes to the memory allocation counter and checks against the limit.
 // Raises a Lua error if the allocation would exceed the memory limit.
 func (ls *LState) TrackAlloc(bytes int64) {
@@ -708,8 +715,7 @@ func (ls *LState) TrackAlloc(bytes int64) {
 
 	// Only check limit if one is set
 	if ls.maxBytes > 0 && ls.allocatedBytes > ls.maxBytes {
-		ls.RaiseError("memory limit exceeded: %d bytes allocated, limit is %d bytes",
-			ls.allocatedBytes, ls.maxBytes)
+		ls.RaiseError("%s", ls.memoryLimitError(ls.allocatedBytes))
 	}
 }
 
@@ -1656,21 +1662,22 @@ func (ls *LState) CreateTable(acap, hcap int) *LTable {
 	return ls.newLTable(acap, hcap)
 }
 
-// TryCreateTable is CreateTable that reports failure instead of raising when the
+// TryCreateTable is CreateTable that returns an error instead of raising when the
 // allocation would exceed the state's memory limit. Callers building a table from Go
 // before entering a protected call must use this: a raise with no protected frame on
 // the stack panics rather than unwinding into an error.
-func (ls *LState) TryCreateTable(acap, hcap int) (*LTable, bool) {
+func (ls *LState) TryCreateTable(acap, hcap int) (*LTable, error) {
 	if acap < 0 {
 		acap = 0
 	}
 	if hcap < 0 {
 		hcap = 0
 	}
-	if ls.maxBytes > 0 && ls.allocatedBytes+ltableSize(acap, hcap) > ls.maxBytes {
-		return nil, false
+	attemptedBytes := ls.allocatedBytes + ltableSize(acap, hcap)
+	if ls.maxBytes > 0 && attemptedBytes > ls.maxBytes {
+		return nil, ls.memoryLimitError(attemptedBytes)
 	}
-	return ls.newLTable(acap, hcap), true
+	return ls.newLTable(acap, hcap), nil
 }
 
 // NewThread returns a new LState that shares with the original state all global objects.

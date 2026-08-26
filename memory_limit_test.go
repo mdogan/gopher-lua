@@ -1,6 +1,7 @@
 package lua
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -803,9 +804,9 @@ func TestTryCreateTable_WithinLimit(t *testing.T) {
 	L.ResetMemoryUsage()
 	L.SetMemoryLimit(10 * 1024)
 
-	tb, ok := L.TryCreateTable(8, 0)
-	if !ok {
-		t.Fatal("Expected TryCreateTable to succeed within the limit")
+	tb, err := L.TryCreateTable(8, 0)
+	if err != nil {
+		t.Fatalf("Expected TryCreateTable to succeed within the limit, got: %v", err)
 	}
 	if tb == nil {
 		t.Fatal("Expected a table")
@@ -832,12 +833,22 @@ func TestTryCreateTable_OverLimit(t *testing.T) {
 	L.ResetMemoryUsage()
 	L.SetMemoryLimit(1024)
 
-	tb, ok := L.TryCreateTable(1024*1024, 0)
-	if ok {
-		t.Fatal("Expected TryCreateTable to report failure over the limit")
+	tb, err := L.TryCreateTable(1024*1024, 0)
+	if err == nil {
+		t.Fatal("Expected TryCreateTable to return an error over the limit")
 	}
 	if tb != nil {
 		t.Error("Expected no table on failure")
+	}
+	expected := fmt.Sprintf(
+		"memory limit exceeded: %d bytes allocated, limit is %d bytes",
+		ltableSize(1024*1024, 0), 1024,
+	)
+	if err.Error() != expected {
+		t.Errorf("Expected %q, got: %v", expected, err)
+	}
+	if _, ok := err.(*ApiError); ok {
+		t.Errorf("Expected a plain Go error, got an ApiError: %v", err)
 	}
 	if L.GetAllocatedBytes() != 0 {
 		t.Error("Expected a rejected allocation not to be charged")
@@ -862,7 +873,7 @@ func TestTryCreateTable_NoLimit(t *testing.T) {
 	L.ResetMemoryUsage()
 	L.SetMemoryLimit(0)
 
-	if _, ok := L.TryCreateTable(1024*1024, 0); !ok {
-		t.Fatal("Expected TryCreateTable to succeed when no limit is set")
+	if _, err := L.TryCreateTable(1024*1024, 0); err != nil {
+		t.Fatalf("Expected TryCreateTable to succeed when no limit is set, got: %v", err)
 	}
 }
