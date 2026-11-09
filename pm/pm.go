@@ -2,6 +2,7 @@
 package pm
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -9,6 +10,10 @@ const (
 	EOS               = -1
 	_UNKNOWN          = -2
 	maxRecursionLevel = 1000000
+	// ctxCheckInterval is how many matcher steps run between two context
+	// checks. A step is one VM instruction, one byte scanned by %b or a
+	// back-reference, or one entry of a character set checked against a byte.
+	ctxCheckInterval = 1024
 )
 
 /* Error {{{ */
@@ -525,23 +530,56 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 
 /* VM {{{ */
 
+// ctxDone is the panic value used to stop matching when the context is done.
+type ctxDone struct{ err error }
+
+type matcher struct {
+	src   []byte
+	insts []inst
+	ctx   context.Context // nil when there is no context to check
+	steps int
+}
+
+// step counts n units of matching work and, once ctxCheckInterval steps
+// have run since the last check, stops matching with a ctxDone panic if the
+// context is done.
+func (vm *matcher) step(n int) {
+	if vm.ctx == nil {
+		return
+	}
+	vm.steps += n
+	if vm.steps >= ctxCheckInterval {
+		vm.checkContext()
+	}
+}
+
+// checkContext is kept out of line so that step stays small enough to inline.
+//
+//go:noinline
+func (vm *matcher) checkContext() {
+	vm.steps = 0
+	if err := vm.ctx.Err(); err != nil {
+		panic(ctxDone{err})
+	}
+}
+
 // Simple recursive virtual machine based on the
 // "Regular Expression Matching: the Virtual Machine Approach" (https://swtch.com/~rsc/regexp/regexp2.html)
-func recursiveVM(src []byte, insts []inst, pc, sp, recLevel int, ms ...*MatchData) (bool, int, *MatchData) {
+func (vm *matcher) recursiveVM(pc, sp, recLevel int, m *MatchData) (bool, int, *MatchData) {
 	recLevel++
 	if recLevel > maxRecursionLevel {
 		panic(newError(_UNKNOWN, "pattern/input too complex"))
 	}
-	var m *MatchData
-	if len(ms) == 0 {
-		m = newMatchState()
-	} else {
-		m = ms[0]
-	}
+	src, insts := vm.src, vm.insts
 redo:
+	vm.step(1)
 	inst := insts[pc]
 	switch inst.OpCode {
 	case opChar:
+		if set, ok := inst.Class.(*setClass); ok && vm.ctx != nil {
+			// Matches checks the set entries one by one.
+			vm.step(len(set.Classes))
+		}
 		if sp >= len(src) || !inst.Class.Matches(int(src[sp])) {
 			return false, sp, m
 		}
@@ -556,14 +594,14 @@ redo:
 		pc = inst.Operand1
 		goto redo
 	case opSplit:
-		if ok, nsp, _ := recursiveVM(src, insts, inst.Operand1, sp, recLevel, m); ok {
+		if ok, nsp, _ := vm.recursiveVM(inst.Operand1, sp, recLevel, m); ok {
 			return true, nsp, m
 		}
 		pc = inst.Operand2
 		goto redo
 	case opSave:
 		s := m.setCapture(inst.Operand1, sp)
-		if ok, nsp, _ := recursiveVM(src, insts, pc+1, sp, recLevel, m); ok {
+		if ok, nsp, _ := vm.recursiveVM(pc+1, sp, recLevel, m); ok {
 			return true, nsp, m
 		}
 		m.restoreCapture(inst.Operand1, s)
@@ -578,6 +616,7 @@ redo:
 		}
 		count := 1
 		for sp = sp + 1; sp < len(src); sp++ {
+			vm.step(1)
 			if int(src[sp]) == inst.Operand2 {
 				count--
 			}
@@ -598,6 +637,7 @@ redo:
 		}
 		capture := src[m.Capture(idx):m.Capture(idx+1)]
 		for i := 0; i < len(capture); i++ {
+			vm.step(1)
 			if i+sp >= len(src) || capture[i] != src[i+sp] {
 				return false, sp, m
 			}
@@ -613,21 +653,38 @@ redo:
 
 /* API {{{ */
 
+// Find finds up to limit matches of pattern p in src, starting at offset.
+// A negative limit means no limit.
 func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err error) {
+	return FindContext(nil, p, src, offset, limit)
+}
+
+// FindContext is like Find, but stops when ctx is done and returns ctx.Err().
+// Backtracking on some patterns takes exponential time, so callers that run
+// untrusted patterns should pass a context with a deadline. ctx may be nil.
+func FindContext(ctx context.Context, p string, src []byte, offset, limit int) (matches []*MatchData, err error) {
 	defer func() {
 		if v := recover(); v != nil {
-			if perr, ok := v.(*Error); ok {
+			switch perr := v.(type) {
+			case *Error:
 				err = perr
-			} else {
+			case ctxDone:
+				err = perr.err
+			default:
 				panic(v)
 			}
 		}
 	}()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	pat := parsePattern(newScanner([]byte(p)), true)
-	insts := compilePattern(pat)
+	vm := &matcher{src: src, insts: compilePattern(pat), ctx: ctx}
 	matches = []*MatchData{}
 	for sp := offset; sp <= len(src); {
-		ok, nsp, ms := recursiveVM(src, insts, 0, sp, 0)
+		ok, nsp, ms := vm.recursiveVM(0, sp, 0, newMatchState())
 		sp++
 		if ok {
 			if sp < nsp {

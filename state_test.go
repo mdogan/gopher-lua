@@ -665,6 +665,36 @@ func TestContextTimeout(t *testing.T) {
 	errorIfNotNil(t, L.ctx)
 }
 
+func TestContextTimeoutPatternMatch(t *testing.T) {
+	// Each script spends almost all its time inside one pattern match call,
+	// where the VM loop never gets to check the context.
+	scripts := map[string]string{
+		"find":   `return string.find(string.rep("a", 40), "a*a*a*a*a*a*a*a*a*a*b")`,
+		"match":  `return string.match(string.rep("a", 40), "a*a*a*a*a*a*a*a*a*a*b")`,
+		"gmatch": `for _ in string.gmatch(string.rep("x", 2000), ".-.-.-y") do end`,
+		"gsub":   `return string.gsub(string.rep("x", 2000), ".-.-.-y", "")`,
+	}
+	for name, script := range scripts {
+		t.Run(name, func(t *testing.T) {
+			L := NewState()
+			defer L.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			L.SetContext(ctx)
+
+			start := time.Now()
+			err := L.DoString(script)
+			elapsed := time.Since(start)
+
+			errorIfNil(t, err)
+			if err != nil {
+				errorIfFalse(t, strings.Contains(err.Error(), "context deadline exceeded"), "unexpected error: %v", err)
+			}
+			errorIfFalse(t, elapsed < 2*time.Second, "script ran for %v after a 100ms deadline", elapsed)
+		})
+	}
+}
+
 func TestContextCancel(t *testing.T) {
 	L := NewState()
 	defer L.Close()
