@@ -748,6 +748,40 @@ func TestContextWithCroutine(t *testing.T) {
 
 }
 
+// A Go function used directly as a coroutine body returns its results to the
+// resumer and leaves the coroutine dead, as in Lua 5.1. It used to return
+// nothing and leave the coroutine "running" forever.
+func TestCoroutineGoFunctionBody(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+	  local co = coroutine.create(string.upper)
+	  local ok, v = coroutine.resume(co, "x")
+	  assert(ok == true and v == "X", tostring(ok) .. " " .. tostring(v))
+	  assert(coroutine.status(co) == "dead", coroutine.status(co))
+	  ok, v = coroutine.resume(co)
+	  assert(not ok and v == "can not resume a dead thread", v)
+
+	  local w = coroutine.wrap(string.rep)
+	  assert(w("ab", 2) == "abab")
+
+	  co = coroutine.create(error)
+	  ok, v = coroutine.resume(co, "boom")
+	  assert(not ok and string.find(v, "boom", 1, true), tostring(v))
+	  assert(coroutine.status(co) == "dead", coroutine.status(co))
+
+	  co = coroutine.create(coroutine.yield)
+	  ok, v = coroutine.resume(co, 1)
+	  assert(ok and v == 1, tostring(v))
+	  assert(coroutine.status(co) == "suspended", coroutine.status(co))
+
+	  -- The main state can still run other coroutines afterwards.
+	  co = coroutine.create(function() coroutine.yield(1) return 2 end)
+	  assert(select(2, coroutine.resume(co)) == 1)
+	  assert(select(2, coroutine.resume(co)) == 2)
+	`)
+}
+
 func TestPCallAfterFail(t *testing.T) {
 	L := NewState()
 	defer L.Close()

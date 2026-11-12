@@ -119,7 +119,11 @@ func callGFunction(L *LState, tailcall bool) bool {
 		wantret = gfnret
 	}
 
-	if tailcall && L.Parent != nil && L.stack.Sp() == 1 {
+	// The function was the coroutine's last frame: either a tail call from
+	// its body, or a Go function used directly as the body
+	// (coroutine.create(print)). Hand the results to the resumer and finish
+	// the thread, as a Lua body does on return.
+	if L.Parent != nil && L.stack.Sp() == 1 {
 		switchToParentThread(L, wantret, false, true)
 		return true
 	}
