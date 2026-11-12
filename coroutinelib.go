@@ -63,6 +63,14 @@ func coResume(L *LState) int {
 	}
 	th.Parent = L
 	L.G.CurrentThread = th
+	// The coroutine runs under the resumer's context, not the one it got at
+	// creation. A coroutine can outlive the call that created it and be
+	// resumed by a later call: with the creation context it would keep the
+	// creator's context values and miss the resumer's deadline (a coroutine
+	// created with no context would never time out at all).
+	prevCtx, prevMainLoop := th.ctx, th.mainLoop
+	th.ctx, th.mainLoop = L.ctx, L.mainLoop
+	defer func() { th.ctx, th.mainLoop = prevCtx, prevMainLoop }()
 	if !th.isStarted() {
 		cf := th.stack.Last()
 		th.currentFrame = cf

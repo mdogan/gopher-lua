@@ -748,6 +748,78 @@ func TestContextWithCroutine(t *testing.T) {
 
 }
 
+type coCtxKey struct{}
+
+// A coroutine created while the state had no context must still stop at the
+// deadline of the call that resumes it.
+func TestContextLuaResumeUsesResumerDeadline(t *testing.T) {
+	for name, script := range map[string]string{
+		"resume": `local ok, err = coroutine.resume(co); error(err)`,
+		"wrap":   `w()`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			L := NewState()
+			defer L.Close()
+			// Created with no context, as a library's top-level code would.
+			errorIfScriptFail(t, L, `
+			  co = coroutine.create(function() while true do end end)
+			  w = coroutine.wrap(function() while true do end end)
+			`)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			L.SetContext(ctx)
+			done := make(chan error, 1)
+			go func() { done <- L.DoString(script) }()
+			select {
+			case err := <-done:
+				errorIfNil(t, err)
+				if err != nil {
+					errorIfFalse(t, strings.Contains(err.Error(), "context deadline exceeded"), "unexpected error: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("coroutine still running 5s after a 100ms deadline")
+			}
+		})
+	}
+}
+
+// A coroutine resumed by a later call sees that call's context values, not its
+// creator's, and is not stopped by the creator's (cancelled) context. This
+// holds for a Go function used directly as the coroutine body too.
+func TestContextLuaResumeUsesResumerValues(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetGlobal("who", L.NewFunction(func(L *LState) int {
+		L.Push(LString(L.Context().Value(coCtxKey{}).(string)))
+		return 1
+	}))
+
+	first, cancelFirst := context.WithCancel(context.WithValue(context.Background(), coCtxKey{}, "first"))
+	L.SetContext(first)
+	errorIfScriptFail(t, L, `
+	  lua_co = coroutine.create(function()
+	    while true do coroutine.yield(who()) end
+	  end)
+	  go_co = coroutine.create(who)
+	  local _, v = coroutine.resume(lua_co)
+	  assert(v == "first", v)
+	`)
+	cancelFirst()
+
+	second, cancelSecond := context.WithCancel(context.WithValue(context.Background(), coCtxKey{}, "second"))
+	defer cancelSecond()
+	L.SetContext(second)
+	errorIfScriptFail(t, L, `
+	  local ok, v = coroutine.resume(lua_co)
+	  assert(ok, v)
+	  assert(v == "second", v)
+	  ok, v = coroutine.resume(go_co)
+	  assert(ok, v)
+	  assert(v == "second", v)
+	`)
+}
+
 // A Go function used directly as a coroutine body returns its results to the
 // resumer and leaves the coroutine dead, as in Lua 5.1. It used to return
 // nothing and leave the coroutine "running" forever.
@@ -779,6 +851,42 @@ func TestCoroutineGoFunctionBody(t *testing.T) {
 	  co = coroutine.create(function() coroutine.yield(1) return 2 end)
 	  assert(select(2, coroutine.resume(co)) == 1)
 	  assert(select(2, coroutine.resume(co)) == 2)
+	`)
+}
+
+// Nested coroutines inherit the context through every level of resume, and the
+// resumer's context is only lent for the duration of the resume.
+func TestContextLuaResumeNested(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetGlobal("who", L.NewFunction(func(L *LState) int {
+		if L.Context() == nil {
+			L.Push(LString("none"))
+			return 1
+		}
+		L.Push(LString(L.Context().Value(coCtxKey{}).(string)))
+		return 1
+	}))
+	errorIfScriptFail(t, L, `
+	  inner = coroutine.wrap(function() while true do coroutine.yield(who()) end end)
+	  outer = coroutine.create(function() while true do coroutine.yield(inner()) end end)
+	`)
+
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), coCtxKey{}, "caller"))
+	defer cancel()
+	L.SetContext(ctx)
+	errorIfScriptFail(t, L, `
+	  local ok, v = coroutine.resume(outer)
+	  assert(ok, v)
+	  assert(v == "caller", v)
+	`)
+
+	// Yielded threads do not keep the resumer's context.
+	L.RemoveContext()
+	errorIfScriptFail(t, L, `
+	  local ok, v = coroutine.resume(outer)
+	  assert(ok, v)
+	  assert(v == "none", v)
 	`)
 }
 
