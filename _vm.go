@@ -150,6 +150,13 @@ func threadRun(L *LState) {
 			if parent := L.Parent; parent != nil {
 				if L.wrapped {
 					L.Push(lv)
+					// Finish the thread as the non-wrapped path does, then
+					// re-raise in the resumer. Before, the dead thread kept its
+					// Parent and stayed the current thread, and a later call
+					// re-entered its failed frame.
+					L.G.CurrentThread = parent
+					L.Parent = nil
+					L.kill()
 					parent.Panic(L)
 				} else {
 					L.SetTop(0)

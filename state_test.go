@@ -854,6 +854,41 @@ func TestCoroutineGoFunctionBody(t *testing.T) {
 	`)
 }
 
+// A wrapped coroutine that raises is dead, and the resumer is the running
+// thread again. It used to stay "running" and a later call re-entered its
+// failed frame.
+func TestCoroutineWrapErrorKillsThread(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+	  local n = 0
+	  local w = coroutine.wrap(function() n = n + 1; error("boom") end)
+	  local ok, err = pcall(w)
+	  assert(not ok and string.find(err, "boom", 1, true), tostring(err))
+
+	  -- Run another coroutine in between, as the old bug needed.
+	  local s = coroutine.create(function() coroutine.yield(1) end)
+	  assert(coroutine.resume(s))
+
+	  ok, err = pcall(w)
+	  assert(not ok and string.find(err, "dead", 1, true), tostring(err))
+	  assert(n == 1, n)
+
+	  -- Same through a nested wrap: the outer coroutine stays usable.
+	  local outer = coroutine.create(function()
+	    local inner = coroutine.wrap(function() error("inner") end)
+	    local ok2 = pcall(inner)
+	    coroutine.yield(ok2)
+	    return "done"
+	  end)
+	  local r1, v1 = coroutine.resume(outer)
+	  assert(r1 and v1 == false, tostring(v1))
+	  assert(coroutine.status(outer) == "suspended", coroutine.status(outer))
+	  local r2, v2 = coroutine.resume(outer)
+	  assert(r2 and v2 == "done", tostring(v2))
+	`)
+}
+
 // Nested coroutines inherit the context through every level of resume, and the
 // resumer's context is only lent for the duration of the resume.
 func TestContextLuaResumeNested(t *testing.T) {
