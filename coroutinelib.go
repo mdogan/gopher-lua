@@ -61,6 +61,20 @@ func coResume(L *LState) int {
 		L.Push(LString(msg))
 		return 2
 	}
+	// A thread with a parent is active: it resumed the running thread,
+	// directly or through other coroutines. Resuming it again would re-enter
+	// its frames and recurse until the Go stack overflows (a fatal error, not
+	// a panic). Lua 5.1 rejects it the same way.
+	if th.Parent != nil {
+		msg := "cannot resume non-suspended coroutine"
+		if th.wrapped {
+			L.RaiseError(msg)
+			return 0
+		}
+		L.Push(LFalse)
+		L.Push(LString(msg))
+		return 2
+	}
 	th.Parent = L
 	L.G.CurrentThread = th
 	// The coroutine runs under the resumer's context, not the one it got at

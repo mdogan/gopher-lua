@@ -2067,7 +2067,9 @@ func (ls *LState) Status(th *LState) string {
 		status = "dead"
 	} else if ls.G.CurrentThread == th {
 		status = "running"
-	} else if ls.Parent == th {
+	} else if th.Parent != nil || th == ls.G.MainThread {
+		// Active, but resumed another coroutine that is running now. The
+		// main thread has no Parent and is never suspended.
 		status = "normal"
 	}
 	return status

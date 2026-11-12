@@ -854,6 +854,61 @@ func TestCoroutineGoFunctionBody(t *testing.T) {
 	`)
 }
 
+// Resuming a coroutine that is active further up the resume chain must fail
+// like Lua 5.1 ("cannot resume non-suspended coroutine"). It used to re-enter
+// the coroutine and crash the process with a Go stack overflow.
+func TestCoroutineResumeActiveAncestor(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetGlobal("mainThread", L)
+	errorIfScriptFail(t, L, `
+	  local msg = "cannot resume non-suspended coroutine"
+
+	  -- b created outside a.
+	  local a
+	  local b = coroutine.create(function()
+	    assert(coroutine.status(a) == "normal", coroutine.status(a))
+	    return coroutine.resume(a)
+	  end)
+	  a = coroutine.create(function() return coroutine.resume(b) end)
+	  local ok, okb, oka, err = coroutine.resume(a)
+	  assert(ok and okb and oka == false and err == msg, tostring(err))
+	  assert(coroutine.status(a) == "dead" and coroutine.status(b) == "dead")
+
+	  -- Three levels: c resumes a, its grandparent.
+	  local c
+	  a = coroutine.create(function()
+	    b = coroutine.create(function()
+	      c = coroutine.create(function() return coroutine.resume(a) end)
+	      return coroutine.resume(c)
+	    end)
+	    return coroutine.resume(b)
+	  end)
+	  local r = {coroutine.resume(a)}
+	  assert(r[1] and r[2] and r[3] and r[4] == false and r[5] == msg, tostring(r[5]))
+
+	  -- A wrapped coroutine re-entered through a child raises the error.
+	  local w
+	  w = coroutine.wrap(function()
+	    local inner = coroutine.create(function() return w() end)
+	    return coroutine.resume(inner)
+	  end)
+	  local okw, errw = w()
+	  assert(okw == false and string.find(errw, msg, 1, true), tostring(errw))
+
+	  -- The main thread is "normal" while a coroutine runs.
+	  local m = coroutine.create(function() return coroutine.status(mainThread) end)
+	  local okm, sm = coroutine.resume(m)
+	  assert(okm and sm == "normal", tostring(sm))
+
+	  -- A suspended coroutine still resumes normally afterwards.
+	  local s = coroutine.create(function() coroutine.yield(1) return 2 end)
+	  assert(select(2, coroutine.resume(s)) == 1)
+	  assert(coroutine.status(s) == "suspended")
+	  assert(select(2, coroutine.resume(s)) == 2)
+	`)
+}
+
 // A wrapped coroutine that raises is dead, and the resumer is the running
 // thread again. It used to stay "running" and a later call re-entered its
 // failed frame.
