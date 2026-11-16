@@ -143,6 +143,23 @@ func TokenName(c int) string {
 	return string([]byte{byte(c)})
 }
 
+// maxParseStack is how many entries the parser stack can hold. Each level of
+// nesting (a block, a call, a parenthesis, a unary operator, a right
+// associative operator) keeps a few entries on it, so this allows a few
+// hundred levels, like C Lua's limit of 200 (LUAI_MAXCCALLS). Without it, the
+// stack grows with the input: 100 KB of nested unary operators took 69 MB.
+const maxParseStack = 1024
+
+// yyGrowStack returns a new parser stack twice the size of s, or fails the
+// parse when s is already at maxParseStack. The Makefile makes goyacc's
+// generated code call it instead of growing the stack itself.
+func yyGrowStack(yylex yyLexer, s []yySymType) []yySymType {
+	if len(s) >= maxParseStack {
+		yylex.Error("chunk has too many syntax levels")
+	}
+	return make([]yySymType, len(s)*2)
+}
+
 //line yacctab:1
 var yyExca = [...]int8{
 	-1, 1,
@@ -552,7 +569,7 @@ yystack:
 
 	yyp++
 	if yyp >= len(yyS) {
-		nyys := make([]yySymType, len(yyS)*2)
+		nyys := yyGrowStack(yylex, yyS)
 		copy(nyys, yyS)
 		yyS = nyys
 	}
@@ -670,7 +687,7 @@ yydefault:
 	// yyp is now the index of $0. Perform the default action. Iff the
 	// reduced production is ε, $1 is possibly out of range.
 	if yyp+1 >= len(yyS) {
-		nyys := make([]yySymType, len(yyS)*2)
+		nyys := yyGrowStack(yylex, yyS)
 		copy(nyys, yyS)
 		yyS = nyys
 	}

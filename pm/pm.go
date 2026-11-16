@@ -7,9 +7,18 @@ import (
 )
 
 const (
-	EOS               = -1
-	_UNKNOWN          = -2
-	maxRecursionLevel = 1000000
+	EOS      = -1
+	_UNKNOWN = -2
+	// maxRecursionLevel is how deep the matcher can recurse. It recurses once
+	// per capture boundary and once per repeat or optional item it is trying,
+	// so the depth depends on the pattern only, not on the input. A level is
+	// about 450 bytes of stack. C Lua 5.2 and later stop at 200 (MAXCCALLS);
+	// Lua 5.1 has no limit, so allow more.
+	maxRecursionLevel = 1000
+	// maxCaptures is how many captures a pattern can have, Lua 5.1's
+	// LUA_MAXCAPTURES. It also bounds how deep parsePattern and
+	// compilePattern recurse, once per nested capture.
+	maxCaptures = 32
 	// ctxCheckInterval is how many matcher steps run between two context
 	// checks. A step is one VM instruction, one byte scanned by %b or a
 	// back-reference, or one entry of a character set checked against a byte.
@@ -93,6 +102,8 @@ type scanner struct {
 	src   []byte
 	State scannerState
 	saved scannerState
+	// captures is how many captures were parsed so far.
+	captures int
 }
 
 func newScanner(src []byte) *scanner {
@@ -175,6 +186,11 @@ const (
 	opPSave
 	opBrace
 	opNumber
+	// opRepeat matches Class repeated, then the rest of the pattern.
+	// Operand1 is the fewest repeats (0 for '*', 1 for '+'). Operand2 is 1
+	// when it is lazy ('-'): it tries the fewest repeats first instead of
+	// the most.
+	opRepeat
 )
 
 type inst struct {
@@ -418,6 +434,10 @@ func parsePattern(sc *scanner, toplevel bool) *seqPattern {
 			}
 			return pat
 		case '(':
+			sc.captures++
+			if sc.captures > maxCaptures {
+				panic(newError(sc.CurrentPos(), "too many captures"))
+			}
 			sc.Next()
 			if sc.Peek() == ')' {
 				sc.Next()
@@ -463,14 +483,39 @@ exit:
 type iptr struct {
 	insts   []inst
 	capture int
+	// kinds holds the kind of each capture started so far, by its first
+	// slot.
+	kinds map[int]captureKind
 }
+
+type captureKind int
+
+const (
+	captureOpen captureKind = iota
+	captureClosed
+	capturePosition
+)
+
+// What an opNumber instruction does, in its Operand2. A pattern has no
+// alternatives and no repeated groups, so whether capture N is started,
+// closed or a position capture at %N is known when the pattern is compiled.
+const (
+	// backrefMatch matches the text of the capture.
+	backrefMatch = iota
+	// backrefInvalid raises "invalid capture index": the capture is not
+	// started or not closed yet.
+	backrefInvalid
+	// backrefPosition never matches: the capture is a position capture. In
+	// Lua 5.1 its length is (size_t)CAP_POSITION, longer than any input.
+	backrefPosition
+)
 
 func compilePattern(p pattern, ps ...*iptr) []inst {
 	var ptr *iptr
 	toplevel := false
 	if len(ps) == 0 {
 		toplevel = true
-		ptr = &iptr{[]inst{inst{opSave, nil, 0, -1}}, 2}
+		ptr = &iptr{[]inst{inst{opSave, nil, 0, -1}}, 2, map[int]captureKind{}}
 	} else {
 		ptr = ps[0]
 	}
@@ -485,37 +530,39 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 		idx := len(ptr.insts)
 		switch pat.Type {
 		case '*':
-			ptr.insts = append(ptr.insts,
-				inst{opSplit, nil, idx + 1, idx + 3},
-				inst{opChar, pat.Class, -1, -1},
-				inst{opJmp, nil, idx, -1})
+			ptr.insts = append(ptr.insts, inst{opRepeat, pat.Class, 0, 0})
 		case '+':
-			ptr.insts = append(ptr.insts,
-				inst{opChar, pat.Class, -1, -1},
-				inst{opSplit, nil, idx, idx + 2})
+			ptr.insts = append(ptr.insts, inst{opRepeat, pat.Class, 1, 0})
 		case '-':
-			ptr.insts = append(ptr.insts,
-				inst{opSplit, nil, idx + 3, idx + 1},
-				inst{opChar, pat.Class, -1, -1},
-				inst{opJmp, nil, idx, -1})
+			ptr.insts = append(ptr.insts, inst{opRepeat, pat.Class, 0, 1})
 		case '?':
 			ptr.insts = append(ptr.insts,
 				inst{opSplit, nil, idx + 1, idx + 2},
 				inst{opChar, pat.Class, -1, -1})
 		}
 	case *posCapPattern:
+		ptr.kinds[ptr.capture] = capturePosition
 		ptr.insts = append(ptr.insts, inst{opPSave, nil, ptr.capture, -1})
 		ptr.capture += 2
 	case *capPattern:
 		c0, c1 := ptr.capture, ptr.capture+1
 		ptr.capture += 2
+		ptr.kinds[c0] = captureOpen
 		ptr.insts = append(ptr.insts, inst{opSave, nil, c0, -1})
 		compilePattern(pat.Pattern, ptr)
 		ptr.insts = append(ptr.insts, inst{opSave, nil, c1, -1})
+		ptr.kinds[c0] = captureClosed
 	case *bracePattern:
 		ptr.insts = append(ptr.insts, inst{opBrace, nil, pat.Begin, pat.End})
 	case *numberPattern:
-		ptr.insts = append(ptr.insts, inst{opNumber, nil, pat.N, -1})
+		backref := backrefInvalid
+		switch kind, ok := ptr.kinds[pat.N*2]; {
+		case ok && kind == captureClosed:
+			backref = backrefMatch
+		case ok && kind == capturePosition:
+			backref = backrefPosition
+		}
+		ptr.insts = append(ptr.insts, inst{opNumber, nil, pat.N, backref})
 	}
 	if toplevel {
 		if p.(*seqPattern).MustTail {
@@ -563,12 +610,22 @@ func (vm *matcher) checkContext() {
 	}
 }
 
+// matches reports whether ch is in class c, and counts the work as steps.
+func (vm *matcher) matches(c class, ch byte) bool {
+	vm.step(1)
+	if set, ok := c.(*setClass); ok && vm.ctx != nil {
+		// Matches checks the set entries one by one.
+		vm.step(len(set.Classes))
+	}
+	return c.Matches(int(ch))
+}
+
 // Simple recursive virtual machine based on the
 // "Regular Expression Matching: the Virtual Machine Approach" (https://swtch.com/~rsc/regexp/regexp2.html)
 func (vm *matcher) recursiveVM(pc, sp, recLevel int, m *MatchData) (bool, int, *MatchData) {
 	recLevel++
 	if recLevel > maxRecursionLevel {
-		panic(newError(_UNKNOWN, "pattern/input too complex"))
+		panic(newError(_UNKNOWN, "pattern too complex"))
 	}
 	src, insts := vm.src, vm.insts
 redo:
@@ -576,16 +633,53 @@ redo:
 	inst := insts[pc]
 	switch inst.OpCode {
 	case opChar:
-		if set, ok := inst.Class.(*setClass); ok && vm.ctx != nil {
-			// Matches checks the set entries one by one.
-			vm.step(len(set.Classes))
-		}
-		if sp >= len(src) || !inst.Class.Matches(int(src[sp])) {
+		if sp >= len(src) || !vm.matches(inst.Class, src[sp]) {
 			return false, sp, m
 		}
 		pc++
 		sp++
 		goto redo
+	case opRepeat:
+		// The repeated item is one character class, so the repeats are tried
+		// in a loop, as C Lua does (max_expand and min_expand), instead of
+		// recursing once per repeated byte. Only the rest of the pattern is
+		// matched recursively, once per try.
+		minimum := sp + inst.Operand1
+		if inst.Operand2 == 0 {
+			// Greedy: find the most repeats, then try the rest of the
+			// pattern after each count, from the most to the fewest.
+			end := sp
+			for end < len(src) && vm.matches(inst.Class, src[end]) {
+				end++
+			}
+			for ; end > minimum; end-- {
+				if ok, nsp, _ := vm.recursiveVM(pc+1, end, recLevel, m); ok {
+					return true, nsp, m
+				}
+			}
+			if end < minimum {
+				return false, sp, m
+			}
+			sp = end
+			pc++
+			goto redo
+		}
+		// Lazy: try the rest of the pattern after the fewest repeats, then
+		// after one more repeat at a time.
+		for ; sp < minimum; sp++ {
+			if sp >= len(src) || !vm.matches(inst.Class, src[sp]) {
+				return false, sp, m
+			}
+		}
+		for {
+			if ok, nsp, _ := vm.recursiveVM(pc+1, sp, recLevel, m); ok {
+				return true, nsp, m
+			}
+			if sp >= len(src) || !vm.matches(inst.Class, src[sp]) {
+				return false, sp, m
+			}
+			sp++
+		}
 	case opMatch:
 		return true, sp, m
 	case opTailMatch:
@@ -631,10 +725,13 @@ redo:
 		}
 		return false, sp, m
 	case opNumber:
-		idx := inst.Operand1 * 2
-		if idx >= m.CaptureLength()-1 {
+		switch inst.Operand2 {
+		case backrefInvalid:
 			panic(newError(_UNKNOWN, "invalid capture index"))
+		case backrefPosition:
+			return false, sp, m
 		}
+		idx := inst.Operand1 * 2
 		capture := src[m.Capture(idx):m.Capture(idx+1)]
 		for i := 0; i < len(capture); i++ {
 			vm.step(1)
@@ -692,13 +789,16 @@ func FindEachContext(ctx context.Context, p string, src []byte, offset, limit in
 			}
 		}
 	}()
+	if limit == 0 {
+		return nil
+	}
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
-	pat := parsePattern(newScanner([]byte(p)), true)
-	vm := &matcher{src: src, insts: compilePattern(pat), ctx: ctx}
+	pat := compile(p)
+	vm := &matcher{src: src, insts: pat.insts, ctx: ctx}
 	n := 0
 	for sp := offset; sp <= len(src); {
 		ok, nsp, ms := vm.recursiveVM(0, sp, 0, newMatchState())
@@ -712,11 +812,94 @@ func FindEachContext(ctx context.Context, p string, src []byte, offset, limit in
 				break
 			}
 		}
-		if n == limit || pat.MustHead {
+		if n == limit || pat.mustHead {
 			break
 		}
 	}
 	return
+}
+
+// Pattern is a compiled pattern.
+type Pattern struct {
+	insts    []inst
+	mustHead bool
+}
+
+// Compile compiles the pattern p.
+func Compile(p string) (pat *Pattern, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			perr, ok := v.(*Error)
+			if !ok {
+				panic(v)
+			}
+			err = perr
+		}
+	}()
+	return compile(p), nil
+}
+
+func compile(p string) *Pattern {
+	sp := parsePattern(newScanner([]byte(p)), true)
+	return &Pattern{insts: compilePattern(sp), mustHead: sp.MustHead}
+}
+
+// Matcher finds the matches of a pattern in a string one at a time, in the
+// same order and at the same places as FindEachContext.
+type Matcher struct {
+	vm       matcher
+	mustHead bool
+	// pos is where the next match is looked for.
+	pos  int
+	done bool
+}
+
+// NewMatcher returns a Matcher for the matches of p in src, starting at
+// offset. src must not change while the Matcher is used.
+func (p *Pattern) NewMatcher(src []byte, offset int) *Matcher {
+	return &Matcher{
+		vm:       matcher{src: src, insts: p.insts},
+		mustHead: p.mustHead,
+		pos:      offset,
+	}
+}
+
+// NextContext returns the next match, or nil when there are no more. It
+// stops when ctx is done and returns ctx.Err(); ctx may be nil.
+func (m *Matcher) NextContext(ctx context.Context) (md *MatchData, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			m.done = true
+			switch perr := v.(type) {
+			case *Error:
+				err = perr
+			case ctxDone:
+				err = perr.err
+			default:
+				panic(v)
+			}
+		}
+	}()
+	m.vm.ctx = ctx
+	for !m.done && m.pos <= len(m.vm.src) {
+		sp := m.pos
+		ok, nsp, ms := m.vm.recursiveVM(0, sp, 0, newMatchState())
+		m.pos = sp + 1
+		if m.mustHead {
+			// An anchored pattern is only tried at the offset.
+			m.done = true
+		}
+		if ok {
+			// The next match starts after this one, and at least one byte
+			// later, so an empty match is not found again.
+			if m.pos < nsp {
+				m.pos = nsp
+			}
+			return ms, nil
+		}
+	}
+	m.done = true
+	return nil, nil
 }
 
 // callMatchFunc calls fn outside FindEachContext's recover: a panic in fn

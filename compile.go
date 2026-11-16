@@ -410,6 +410,35 @@ type funcContext struct {
 	labelPc         map[int]int
 	gotosCount      int
 	unresolvedGotos map[int]*gotoLabelDesc
+	// state is shared by all funcContexts of one Compile call.
+	state *compileState
+}
+
+// maxCompileDepth is how deep the compiler recurses into the syntax tree.
+// The parser already limits nesting, but a left associative chain such as
+// a+a+...+a or x == 1 or x == 2 or ... is a tree as deep as it is long, and
+// each level costs about a kilobyte of Go stack.
+const maxCompileDepth = 10000
+
+type compileState struct {
+	// depth is how many expressions and statements are being compiled.
+	depth int
+	// folded caches what constFold returned for an operator expression, so
+	// a chain is folded once instead of once per level.
+	folded map[ast.Expr]ast.Expr
+}
+
+// enterLevel enters one more level of the syntax tree and raises a compile
+// error past maxCompileDepth. Pair it with leaveLevel.
+func (fc *funcContext) enterLevel(line int) {
+	fc.state.depth++
+	if fc.state.depth > maxCompileDepth {
+		raiseCompileError(fc, line, "chunk has too many syntax levels")
+	}
+}
+
+func (fc *funcContext) leaveLevel() {
+	fc.state.depth--
 }
 
 func newFuncContext(sourcename string, parent *funcContext) *funcContext {
@@ -424,6 +453,11 @@ func newFuncContext(sourcename string, parent *funcContext) *funcContext {
 		labelPc:         map[int]int{},
 		gotosCount:      0,
 		unresolvedGotos: map[int]*gotoLabelDesc{},
+	}
+	if parent != nil {
+		fc.state = parent.state
+	} else {
+		fc.state = &compileState{folded: map[ast.Expr]ast.Expr{}}
 	}
 	fc.Blocks = []*codeBlock{fc.Block}
 	return fc
@@ -652,6 +686,8 @@ func compileBlock(context *funcContext, chunk []ast.Stmt) { // {{{
 } // }}}
 
 func compileStmt(context *funcContext, stmt ast.Stmt, isLastStmt bool) { // {{{
+	context.enterLevel(sline(stmt))
+	defer context.leaveLevel()
 	switch st := stmt.(type) {
 	case *ast.AssignStmt:
 		compileAssignStmt(context, st)
@@ -930,6 +966,8 @@ func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
 } // }}}
 
 func compileBranchCondition(context *funcContext, reg int, expr ast.Expr, thenlabel, elselabel int, hasnextcond bool) { // {{{
+	context.enterLevel(sline(expr))
+	defer context.leaveLevel()
 	// TODO folding constants?
 	code := context.Code
 	flip := 0
@@ -1140,6 +1178,8 @@ func compileGotoStmt(context *funcContext, stmt *ast.GotoStmt) { // {{{
 } // }}}
 
 func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) int { // {{{
+	context.enterLevel(sline(expr))
+	defer context.leaveLevel()
 	code := context.Code
 	sreg := savereg(ec, reg)
 	sused := 1
@@ -1267,11 +1307,34 @@ func compileExprWithMVPropagation(context *funcContext, expr ast.Expr, reg *int,
 	compileExprWithPropagation(context, expr, reg, save, context.Code.PropagateMV)
 } // }}}
 
-func constFold(exp ast.Expr) ast.Expr { // {{{
+// constFold returns exp with constant arithmetic folded into constants.
+func (fc *funcContext) constFold(exp ast.Expr) ast.Expr { // {{{
+	return fc.constFoldAt(exp, 0)
+} // }}}
+
+func (fc *funcContext) constFoldAt(exp ast.Expr, depth int) ast.Expr { // {{{
+	switch exp.(type) {
+	case *ast.ArithmeticOpExpr, *ast.UnaryMinusOpExpr:
+	default:
+		return exp
+	}
+	if depth > maxCompileDepth {
+		// Leave it unfolded: compiling a tree this deep fails anyway.
+		return exp
+	}
+	if folded, ok := fc.state.folded[exp]; ok {
+		return folded
+	}
+	folded := fc.constFoldOnce(exp, depth)
+	fc.state.folded[exp] = folded
+	return folded
+} // }}}
+
+func (fc *funcContext) constFoldOnce(exp ast.Expr, depth int) ast.Expr { // {{{
 	switch expr := exp.(type) {
 	case *ast.ArithmeticOpExpr:
-		lvalue, lisconst := lnumberValue(constFold(expr.Lhs))
-		rvalue, risconst := lnumberValue(constFold(expr.Rhs))
+		lvalue, lisconst := lnumberValue(fc.constFoldAt(expr.Lhs, depth+1))
+		rvalue, risconst := lnumberValue(fc.constFoldAt(expr.Rhs, depth+1))
 		if lisconst && risconst {
 			switch expr.Operator {
 			case "+":
@@ -1293,7 +1356,7 @@ func constFold(exp ast.Expr) ast.Expr { // {{{
 			return expr
 		}
 	case *ast.UnaryMinusOpExpr:
-		expr.Expr = constFold(expr.Expr)
+		expr.Expr = fc.constFoldAt(expr.Expr, depth+1)
 		if value, ok := lnumberValue(expr.Expr); ok {
 			return &constLValueExpr{Value: LNumber(-value)}
 		}
@@ -1419,7 +1482,7 @@ func compileTableExpr(context *funcContext, reg int, ex *ast.TableExpr, ec *expc
 } // }}}
 
 func compileArithmeticOpExpr(context *funcContext, reg int, expr *ast.ArithmeticOpExpr, ec *expcontext) { // {{{
-	exp := constFold(expr)
+	exp := context.constFold(expr)
 	if ex, ok := exp.(*constLValueExpr); ok {
 		exp.SetLine(sline(expr))
 		compileExpr(context, reg, ex, ec)
@@ -1451,24 +1514,28 @@ func compileArithmeticOpExpr(context *funcContext, reg int, expr *ast.Arithmetic
 } // }}}
 
 func compileStringConcatOpExpr(context *funcContext, reg int, expr *ast.StringConcatOpExpr, ec *expcontext) { // {{{
-	code := context.Code
-	crange := 1
-	for current := expr.Rhs; current != nil; {
-		if ex, ok := current.(*ast.StringConcatOpExpr); ok {
-			crange += 1
-			current = ex.Rhs
-		} else {
-			current = nil
+	// a..b..c is right associative, a..(b..c). Collect the operands of the
+	// chain in one pass and concatenate them with one OP_CONCAT. Compiling
+	// the right side recursively walked the rest of the chain at every
+	// level, which was quadratic in its length.
+	operands := []ast.Expr{expr.Lhs}
+	current := expr.Rhs
+	for {
+		ex, ok := current.(*ast.StringConcatOpExpr)
+		if !ok {
+			break
 		}
+		operands = append(operands, ex.Lhs)
+		current = ex.Rhs
 	}
+	operands = append(operands, current)
+
 	a := savereg(ec, reg)
 	basereg := reg
-	reg += compileExpr(context, reg, expr.Lhs, ecnone(0))
-	reg += compileExpr(context, reg, expr.Rhs, ecnone(0))
-	for pc := code.LastPC(); pc != 0 && opGetOpCode(code.At(pc)) == OP_CONCAT; pc-- {
-		code.Pop()
+	for _, operand := range operands {
+		reg += compileExpr(context, reg, operand, ecnone(0))
 	}
-	code.AddABC(OP_CONCAT, a, basereg, basereg+crange, sline(expr))
+	context.Code.AddABC(OP_CONCAT, a, basereg, basereg+len(operands)-1, sline(expr))
 } // }}}
 
 func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) { // {{{
@@ -1477,7 +1544,7 @@ func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcon
 	var operandexpr ast.Expr
 	switch ex := expr.(type) {
 	case *ast.UnaryMinusOpExpr:
-		exp := constFold(ex)
+		exp := context.constFold(ex)
 		if lvexpr, ok := exp.(*constLValueExpr); ok {
 			exp.SetLine(sline(expr))
 			compileExpr(context, reg, lvexpr, ec)
@@ -1574,6 +1641,8 @@ func compileLogicalOpExpr(context *funcContext, reg int, expr *ast.LogicalOpExpr
 } // }}}
 
 func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *expcontext, thenlabel, elselabel int, hasnextcond bool, lb *lblabels) { // {{{
+	context.enterLevel(sline(expr))
+	defer context.leaveLevel()
 	// TODO folding constants?
 	code := context.Code
 	flip := 0

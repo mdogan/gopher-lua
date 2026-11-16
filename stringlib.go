@@ -16,7 +16,7 @@ func OpenString(L *LState) int {
 	// _, ok := L.G.builtinMts[int(LTString)]
 	// if !ok {
 	mod = L.RegisterModule(StringLibName, strFuncs).(*LTable)
-	gmatch := L.NewClosure(strGmatch, L.NewFunction(strGmatchIter))
+	gmatch := L.NewFunction(strGmatch)
 	mod.RawSetString("gmatch", gmatch)
 	mod.RawSetString("gfind", gmatch)
 	mod.RawSetString("__index", mod)
@@ -417,7 +417,15 @@ func strGsub(L *LState) int {
 	pat := L.CheckString(2)
 	L.CheckTypes(3, LTString, LTTable, LTFunction)
 	repl := L.CheckAny(3)
-	limit := L.OptInt(4, -1)
+	// As in Lua 5.1, the count defaults to more than the number of possible
+	// matches, and a count of 0 or less replaces nothing, without looking at
+	// the pattern.
+	limit := L.OptInt(4, len(str)+1)
+	if limit <= 0 {
+		L.Push(LString(str))
+		L.Push(LNumber(0))
+		return 2
+	}
 
 	// Build the result in one pass, while matching, and count it as it
 	// grows. Collecting the matches first held one MatchData per match,
@@ -566,23 +574,25 @@ func strGsubFunc(L *LState, str string, repl *LFunction, match *pm.MatchData) (s
 	return LVAsString(ret), true
 }
 
-type strMatchData struct {
+// strGmatchState is the state of a string.gmatch iterator. Each call of the
+// iterator finds the next match, as in C Lua. Finding every match up front
+// held one MatchData per match, even when the loop stopped early, and none of
+// it was counted against the memory limit.
+type strGmatchState struct {
 	str     string
-	pos     int
-	matches []*pm.MatchData
+	matcher *pm.Matcher
 }
 
 func strGmatchIter(L *LState) int {
-	md := L.CheckUserData(1).Value.(*strMatchData)
-	str := md.str
-	matches := md.matches
-	idx := md.pos
-	md.pos += 1
-	if idx == len(matches) {
+	state := L.Get(UpvalueIndex(1)).(*LUserData).Value.(*strGmatchState)
+	str := state.str
+	match, err := state.matcher.NextContext(L.ctx)
+	if err != nil {
+		L.RaiseError(err.Error())
+	}
+	if match == nil {
 		return 0
 	}
-	L.Push(L.Get(1))
-	match := matches[idx]
 	if match.CaptureLength() == 2 {
 		capture := str[match.Capture(0):match.Capture(1)]
 		L.TrackAlloc(int64(len(capture)))
@@ -605,15 +615,16 @@ func strGmatchIter(L *LState) int {
 func strGmatch(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
-	mds, err := pm.FindContext(L.ctx, pattern, []byte(str), 0, -1)
+	pat, err := pm.Compile(pattern)
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
-	L.Push(L.Get(UpvalueIndex(1)))
+	// Return a closure that holds the state, as C Lua does, so the iterator
+	// can be called on its own: it = s:gmatch(p); it().
 	ud := L.NewUserData()
-	ud.Value = &strMatchData{str, 0, mds}
-	L.Push(ud)
-	return 2
+	ud.Value = &strGmatchState{str, pat.NewMatcher(unsafeFastStringToReadOnlyBytes(str), 0)}
+	L.Push(L.NewClosure(strGmatchIter, ud))
+	return 1
 }
 
 func strLen(L *LState) int {
