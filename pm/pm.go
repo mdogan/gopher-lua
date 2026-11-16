@@ -510,15 +510,8 @@ const (
 	backrefPosition
 )
 
-func compilePattern(p pattern, ps ...*iptr) []inst {
-	var ptr *iptr
-	toplevel := false
-	if len(ps) == 0 {
-		toplevel = true
-		ptr = &iptr{[]inst{inst{opSave, nil, 0, -1}}, 2, map[int]captureKind{}}
-	} else {
-		ptr = ps[0]
-	}
+// compilePattern appends the instructions of p to ptr.insts.
+func compilePattern(p pattern, ptr *iptr) {
 	switch pat := p.(type) {
 	case *singlePattern:
 		ptr.insts = append(ptr.insts, inst{opChar, pat.Class, -1, -1})
@@ -564,13 +557,6 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 		}
 		ptr.insts = append(ptr.insts, inst{opNumber, nil, pat.N, backref})
 	}
-	if toplevel {
-		if p.(*seqPattern).MustTail {
-			ptr.insts = append(ptr.insts, inst{opSave, nil, 1, -1}, inst{opTailMatch, nil, -1, -1})
-		}
-		ptr.insts = append(ptr.insts, inst{opSave, nil, 1, -1}, inst{opMatch, nil, -1, -1})
-	}
-	return ptr.insts
 }
 
 /* }}} parse */
@@ -823,6 +809,8 @@ func FindEachContext(ctx context.Context, p string, src []byte, offset, limit in
 type Pattern struct {
 	insts    []inst
 	mustHead bool
+	// srcLen is the length of the pattern's source.
+	srcLen int
 }
 
 // Compile compiles the pattern p.
@@ -841,7 +829,56 @@ func Compile(p string) (pat *Pattern, err error) {
 
 func compile(p string) *Pattern {
 	sp := parsePattern(newScanner([]byte(p)), true)
-	return &Pattern{insts: compilePattern(sp), mustHead: sp.MustHead}
+	// Each byte of the pattern compiles to at most one instruction, so size
+	// the slice once: growing it allocated about five times its final size.
+	ptr := &iptr{
+		insts:   make([]inst, 0, len(p)+maxExtraInsts),
+		capture: 2,
+		kinds:   map[int]captureKind{},
+	}
+	ptr.insts = append(ptr.insts, inst{opSave, nil, 0, -1})
+	compilePattern(sp, ptr)
+	if sp.MustTail {
+		ptr.insts = append(ptr.insts, inst{opSave, nil, 1, -1}, inst{opTailMatch, nil, -1, -1})
+	}
+	ptr.insts = append(ptr.insts, inst{opSave, nil, 1, -1}, inst{opMatch, nil, -1, -1})
+	return &Pattern{insts: ptr.insts, mustHead: sp.MustHead, srcLen: len(p)}
+}
+
+// maxExtraInsts is how many instructions a pattern has beyond one per byte:
+// the saves of the whole match, the match, and the tail check of '$'.
+const maxExtraInsts = 5
+
+// The memory a pattern takes, per byte of its source. A compiled pattern
+// holds at most one instruction and one character class per byte, or one
+// class and its slot in a set. Compiling also builds the parse tree, and
+// the slices of its sequences grow while it is parsed. Both are upper
+// bounds measured over the kinds of pattern items, with some room.
+const (
+	compiledBytesPerByte  = 80
+	compilingBytesPerByte = 192
+	// compilingOverhead is what compiling a pattern allocates besides the
+	// bytes of the pattern, with room. It is only checked, never counted,
+	// so the room costs nothing.
+	compilingOverhead = 1024
+	// compiledOverhead is what a compiled pattern and one Matcher hold
+	// besides the bytes of the pattern: an empty pattern holds 256 bytes
+	// (the Pattern and room for maxExtraInsts instructions) and a Matcher
+	// 96, on 64-bit. string.gmatch counts it on every call, and the Lua
+	// memory counter never goes down, so it has little room.
+	compiledOverhead = 384
+)
+
+// CompileSize returns an upper bound of the memory compiling the pattern p
+// allocates. Most of it is garbage once the pattern is compiled.
+func CompileSize(p string) int64 {
+	return int64(len(p))*compilingBytesPerByte + compilingOverhead
+}
+
+// Size returns an upper bound of the memory the compiled pattern and one
+// Matcher of it hold.
+func (p *Pattern) Size() int64 {
+	return int64(p.srcLen)*compiledBytesPerByte + compiledOverhead
 }
 
 // Matcher finds the matches of a pattern in a string one at a time, in the

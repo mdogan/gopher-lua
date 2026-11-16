@@ -1,6 +1,7 @@
 package pm
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -154,5 +155,53 @@ func TestFind_LimitZero(t *testing.T) {
 	mds, err := Find("a", []byte("aaa"), 0, 0)
 	if err != nil || len(mds) != 0 {
 		t.Fatalf("got %d matches, err %v", len(mds), err)
+	}
+}
+
+func TestCompileSize_IsUpperBound(t *testing.T) {
+	const n = 50_000
+	for _, p := range []string{
+		strings.Repeat("a", n), strings.Repeat(".", n), strings.Repeat("%a", n/2),
+		strings.Repeat("a*", n/2), strings.Repeat("a?", n/2), strings.Repeat("[a]", n/3),
+		"[" + strings.Repeat("a", n) + "]", "[" + strings.Repeat("a-z", n/3) + "]",
+		"[" + strings.Repeat("%a", n/2) + "]", strings.Repeat("[a-z]*", n/6),
+		strings.Repeat("%bab", n/4), strings.Repeat("()", 16) + strings.Repeat("%1", n/2),
+		strings.Repeat("[^a]", n/4), "^" + strings.Repeat("a", n) + "$", "", "a",
+		strings.Repeat("(a)", 32) + strings.Repeat("a", 100),
+		// Short patterns as string.gmatch uses them, whose fixed part counts.
+		"%a+", "[^,]+", "(%w+)=(%w+)", "%s*(.-)%s*", "%b()", ".",
+	} {
+		// Compile many copies of a short pattern, so that its few hundred
+		// bytes are measured, not the noise of the measurement.
+		copies := max(1, 10_000/(len(p)+1))
+		pats := make([]*Pattern, copies)
+		matchers := make([]*Matcher, copies)
+		src := []byte("x")
+		var before, compiled, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		for i := range pats {
+			pat, err := Compile(p)
+			if err != nil {
+				t.Fatalf("%.20q: %v", p, err)
+			}
+			pats[i] = pat
+		}
+		runtime.ReadMemStats(&compiled)
+		// Size also covers a Matcher, as string.gmatch keeps one.
+		for i, pat := range pats {
+			matchers[i] = pat.NewMatcher(src, 0)
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		n := int64(copies)
+		if allocated := int64(compiled.TotalAlloc-before.TotalAlloc) / n; allocated > CompileSize(p) {
+			t.Errorf("%.20q: compiling allocated %d bytes, bound %d", p, allocated, CompileSize(p))
+		}
+		if kept := (int64(after.HeapAlloc) - int64(before.HeapAlloc)) / n; kept > pats[0].Size() {
+			t.Errorf("%.20q: the pattern and its matcher hold %d bytes, bound %d", p, kept, pats[0].Size())
+		}
+		runtime.KeepAlive(pats)
+		runtime.KeepAlive(matchers)
 	}
 }

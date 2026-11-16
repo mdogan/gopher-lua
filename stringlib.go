@@ -116,6 +116,7 @@ func strFind(L *LState) int {
 		return 2
 	}
 
+	checkPatternAlloc(L, pattern)
 	mds, err := pm.FindContext(L.ctx, pattern, unsafeFastStringToReadOnlyBytes(str), init, 1)
 	if err != nil {
 		L.RaiseError(err.Error())
@@ -437,6 +438,7 @@ func strGsub(L *LState) int {
 		L.TrackAlloc(int64(len(part)))
 		b.WriteString(part)
 	}
+	checkPatternAlloc(L, pat)
 	err := pm.FindEachContext(L.ctx, pat, unsafeFastStringToReadOnlyBytes(str), 0, limit, func(match *pm.MatchData) bool {
 		n++
 		if n%gsubCheckInterval == 0 && L.ctx != nil {
@@ -612,13 +614,24 @@ func strGmatchIter(L *LState) int {
 	return match.CaptureLength()/2 - 1
 }
 
+// checkPatternAlloc raises the memory limit error if compiling pattern could
+// go over the limit. Compiling allocates up to about 150 bytes per byte of
+// the pattern, which is garbage after the call, so it is checked, not
+// counted.
+func checkPatternAlloc(L *LState, pattern string) {
+	L.checkAlloc(pm.CompileSize(pattern))
+}
+
 func strGmatch(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
+	checkPatternAlloc(L, pattern)
 	pat, err := pm.Compile(pattern)
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
+	// The iterator keeps the compiled pattern, so count it.
+	L.TrackAlloc(pat.Size())
 	// Return a closure that holds the state, as C Lua does, so the iterator
 	// can be called on its own: it = s:gmatch(p); it().
 	ud := L.NewUserData()
@@ -654,6 +667,7 @@ func strMatch(L *LState) int {
 		offset = 0
 	}
 
+	checkPatternAlloc(L, pattern)
 	mds, err := pm.FindContext(L.ctx, pattern, unsafeFastStringToReadOnlyBytes(str), offset, 1)
 	if err != nil {
 		L.RaiseError(err.Error())
