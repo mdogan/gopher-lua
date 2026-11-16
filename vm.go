@@ -2385,8 +2385,17 @@ func stringConcat(L *LState, total, last int) LValue {
 				i--
 				total--
 			}
+			// Count the result before it is allocated: the same large
+			// string can be concatenated many times.
+			size := 0
+			for _, s := range buf {
+				if len(s) > math.MaxInt-size {
+					L.RaiseError("resulting string too large")
+				}
+				size += len(s)
+			}
+			L.TrackAlloc(int64(size))
 			result := strings.Join(buf, "")
-			L.TrackAlloc(int64(len(result)))
 			rhs = LString(result)
 		}
 	}

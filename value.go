@@ -202,7 +202,14 @@ type LState struct {
 	ctxCancelFn    context.CancelFunc
 	readonlyBypass int
 
-	// Memory tracking
+	// mem is the memory accounting of this state. Threads share it with the
+	// state that created them.
+	mem *memoryCounter
+}
+
+// memoryCounter counts the bytes allocated by a state and its threads, and
+// holds their memory limit.
+type memoryCounter struct {
 	allocatedBytes int64
 	maxBytes       int64
 }

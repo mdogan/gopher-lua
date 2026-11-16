@@ -588,6 +588,7 @@ func newLState(options Options) *LState {
 		hasErrorFunc: false,
 		mainLoop:     mainLoop,
 		ctx:          nil,
+		mem:          &memoryCounter{},
 	}
 	if options.MinimizeStackMemory {
 		ls.stack = newAutoGrowingCallFrameStack(options.CallStackSize)
@@ -604,39 +605,68 @@ func newLState(options Options) *LState {
 func (ls *LState) memoryLimitError(allocatedBytes int64) error {
 	return fmt.Errorf(
 		"memory limit exceeded: %d bytes allocated, limit is %d bytes",
-		allocatedBytes, ls.maxBytes,
+		allocatedBytes, ls.mem.maxBytes,
 	)
 }
 
 // TrackAlloc adds bytes to the memory allocation counter and checks against the limit.
 // Raises a Lua error if the allocation would exceed the memory limit.
+//
+// The counter and the limit are shared by a state and all threads created
+// from it, so a coroutine cannot allocate past the limit of its creator.
+//
+// A negative size is a size computation that overflowed, so it raises the
+// memory limit error too, even without a limit. Adding it would lower the
+// counter and let the script allocate past the limit.
 func (ls *LState) TrackAlloc(bytes int64) {
-	ls.allocatedBytes += bytes
+	mem := ls.mem
+	if bytes < 0 {
+		ls.RaiseError("memory limit exceeded: invalid allocation size %d bytes", bytes)
+	}
+	if bytes > math.MaxInt64-mem.allocatedBytes {
+		mem.allocatedBytes = math.MaxInt64
+	} else {
+		mem.allocatedBytes += bytes
+	}
 
 	// Only check limit if one is set
-	if ls.maxBytes > 0 && ls.allocatedBytes > ls.maxBytes {
-		ls.RaiseError("%s", ls.memoryLimitError(ls.allocatedBytes))
+	if mem.maxBytes > 0 && mem.allocatedBytes > mem.maxBytes {
+		ls.RaiseError("%s", ls.memoryLimitError(mem.allocatedBytes))
+	}
+}
+
+// checkAlloc raises the memory limit error if allocating bytes more would go
+// over the limit. It does not count them: the caller allocates at most bytes
+// and then counts what it allocated with TrackAlloc.
+func (ls *LState) checkAlloc(bytes int64) {
+	mem := ls.mem
+	if mem.maxBytes > 0 && bytes > mem.maxBytes-mem.allocatedBytes {
+		attempted := int64(math.MaxInt64)
+		if bytes <= math.MaxInt64-mem.allocatedBytes {
+			attempted = mem.allocatedBytes + bytes
+		}
+		ls.RaiseError("%s", ls.memoryLimitError(attempted))
 	}
 }
 
 // ResetMemoryUsage resets the allocated bytes counter to zero.
 func (ls *LState) ResetMemoryUsage() {
-	ls.allocatedBytes = 0
+	ls.mem.allocatedBytes = 0
 }
 
 // SetMemoryLimit sets the maximum memory limit in bytes. Set to 0 to disable limiting.
 func (ls *LState) SetMemoryLimit(maxBytes int64) {
-	ls.maxBytes = maxBytes
+	ls.mem.maxBytes = maxBytes
 }
 
 // GetAllocatedBytes returns the current number of tracked allocated bytes.
 func (ls *LState) GetAllocatedBytes() int64 {
-	return ls.allocatedBytes
+	return ls.mem.allocatedBytes
 }
 
 // GetMemoryLimit returns the current memory limit in bytes (0 if no limit).
 func (ls *LState) GetMemoryLimit() int64 {
-	return ls.maxBytes
+	return ls.mem.maxBytes
 }
 
 /* }}} */
@@ -1460,8 +1490,8 @@ func (ls *LState) TryCreateTable(acap, hcap int) (*LTable, error) {
 	if hcap < 0 {
 		hcap = 0
 	}
-	attemptedBytes := ls.allocatedBytes + ltableSize(acap, hcap)
-	if ls.maxBytes > 0 && attemptedBytes > ls.maxBytes {
+	attemptedBytes := ls.mem.allocatedBytes + ltableSize(acap, hcap)
+	if ls.mem.maxBytes > 0 && attemptedBytes > ls.mem.maxBytes {
 		return nil, ls.memoryLimitError(attemptedBytes)
 	}
 	return ls.newLTable(acap, hcap), nil
@@ -1473,6 +1503,7 @@ func (ls *LState) NewThread() (*LState, context.CancelFunc) {
 	thread := newLState(ls.Options)
 	thread.G = ls.G
 	thread.Env = ls.Env
+	thread.mem = ls.mem
 	var f context.CancelFunc = nil
 	if ls.ctx != nil {
 		thread.mainLoop = mainLoopWithContext

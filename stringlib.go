@@ -2,7 +2,9 @@ package lua
 
 import (
 	"fmt"
+	"math"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yuin/gopher-lua/pm"
 )
@@ -142,13 +144,268 @@ func strFormat(L *LState) int {
 	args := make([]interface{}, L.GetTop()-1)
 	top := L.GetTop()
 	for i := 2; i <= top; i++ {
-		args[i-2] = L.Get(i)
+		args[i-2] = formatArg(L.Get(i))
 	}
 	npat := strings.Count(str, "%") - strings.Count(str, "%%")
-	result := fmt.Sprintf(str, args[:intMin(npat, len(args))]...)
+	args = args[:intMin(npat, len(args))]
+	// fmt builds the whole result before it can be counted, and a large
+	// width or a large argument used many times makes it far larger than
+	// the input. Check an upper bound of its size first.
+	L.checkAlloc(formatSizeBound(str, args))
+	result := fmt.Sprintf(str, args...)
 	L.TrackAlloc(int64(len(result)))
 	L.Push(LString(result))
 	return 1
+}
+
+// formatArg returns the value string.format passes to fmt for v. A value
+// other than a string, number, boolean or nil is passed as its string, as
+// tostring shows it: for verbs other than %s and %v, fmt printed the fields
+// of the Go struct behind it instead, with every string held in a table.
+func formatArg(v LValue) LValue {
+	switch v.(type) {
+	case LString, LNumber, LBool, *LNilType:
+		return v
+	default:
+		return LString(v.String())
+	}
+}
+
+// formatOverhead bounds what fmt adds around a value, such as
+// "%!d(string=" and ")" for a verb that does not fit the type.
+const formatOverhead = 64
+
+// formatSizeBound returns an upper bound of len(fmt.Sprintf(format, args...))
+// for the args formatArg returns.
+//
+// It walks the format the way fmt's doPrintf does (Go 1.26), including for
+// malformed formats, so that it charges every verb to the argument fmt
+// prints with it.
+func formatSizeBound(format string, args []interface{}) int64 {
+	size, reordered := walkFormatSize(format, args, nil)
+	if reordered {
+		// An index such as %[1]s lets many verbs print one argument, and go
+		// back to an argument that was used. Lua has no such syntax, so
+		// instead of following the indexes, count the largest argument for
+		// each verb.
+		size, _ = walkFormatSize(format, args, newFormatArgMax(args))
+	}
+	return size
+}
+
+// walkFormatSize returns formatSizeBound for a format without argument
+// indexes, and reports whether the format has one. Like fmt's reordered, that
+// is a '[' where fmt looks for an index, whether it parses or not; a '[' in
+// the text around the verbs is not one. The walk is the same either way, so
+// the report is exact. With largest, each verb counts the largest argument
+// instead of the next one.
+func walkFormatSize(format string, args []interface{}, largest *formatArgMax) (size int64, reordered bool) {
+	skipIndex := func(i int) (int, bool) {
+		newi, ok := skipFormatArgIndex(format, i)
+		if newi > i {
+			reordered = true
+		}
+		return newi, ok
+	}
+
+	argNum := 0
+	end := len(format)
+	for i := 0; i < end; {
+		lasti := i
+		for i < end && format[i] != '%' {
+			i++
+		}
+		size += int64(i - lasti)
+		if i >= end {
+			break
+		}
+		i++
+
+		sharp := false
+		simple := false
+	flags:
+		for ; i < end; i++ {
+			switch c := format[i]; c {
+			case '#':
+				sharp = true
+			case '0', '+', '-', ' ':
+			default:
+				if 'a' <= c && c <= 'z' && argNum < len(args) {
+					// A verb right after the flags.
+					size += formatOverhead
+					if largest != nil {
+						size += largest.bound(rune(c), sharp)
+					} else {
+						size += formatArgBound(args[argNum], rune(c), sharp)
+					}
+					argNum++
+					i++
+					simple = true
+				}
+				break flags
+			}
+		}
+		if simple {
+			continue
+		}
+
+		var afterIndex bool
+		var width, prec, stars int
+		i, afterIndex = skipIndex(i)
+		if i < end && format[i] == '*' {
+			// The width comes from the next argument. Lua numbers are
+			// float64, never an int, so fmt prints %!(BADWIDTH) instead, but
+			// still uses the argument up.
+			i++
+			stars++
+			if argNum < len(args) {
+				argNum++
+			}
+			afterIndex = false
+		} else {
+			width, _, i = parseFormatNum(format, i, end)
+		}
+		if i+1 < end && format[i] == '.' {
+			i++
+			i, afterIndex = skipIndex(i)
+			if i < end && format[i] == '*' {
+				i++
+				stars++
+				if argNum < len(args) {
+					argNum++
+				}
+				afterIndex = false
+			} else {
+				prec, _, i = parseFormatNum(format, i, end)
+			}
+		}
+		if !afterIndex {
+			i, _ = skipIndex(i)
+		}
+		// Each '*' prints %!(BADWIDTH) or %!(BADPREC).
+		size += int64(stars) * int64(len("%!(BADWIDTH)"))
+		if i >= end {
+			// Prints %!(NOVERB).
+			size += formatOverhead
+			break
+		}
+		verb, n := utf8.DecodeRuneInString(format[i:])
+		i += n
+		if verb == '%' {
+			// Prints one '%', ignores the width and precision, and uses no
+			// argument.
+			size++
+			continue
+		}
+		size += int64(width) + int64(prec) + formatOverhead
+		switch {
+		case largest != nil:
+			// An index can go back to an earlier argument, so argNum may be
+			// past the one fmt prints.
+			size += largest.bound(verb, sharp)
+			argNum++
+		case argNum >= len(args):
+			// Prints %!verb(MISSING).
+		default:
+			size += formatArgBound(args[argNum], verb, sharp)
+			argNum++
+		}
+	}
+	// Arguments no verb used are printed as %!(EXTRA type=value, ...).
+	for _, arg := range args[min(argNum, len(args)):] {
+		size += formatArgBound(arg, 'v', false) + formatOverhead
+	}
+	return size, reordered
+}
+
+// formatArgMax holds the largest formatArgBound of a list of arguments, so
+// that a verb finds it without going through the list.
+type formatArgMax struct {
+	// raw is for the verbs that print a string as it is, other for the rest.
+	raw, other int64
+}
+
+func newFormatArgMax(args []interface{}) *formatArgMax {
+	m := &formatArgMax{}
+	for _, arg := range args {
+		// formatArgBound depends on the verb only through formatPrintsRaw,
+		// so 's' and 'x' stand for every verb.
+		m.raw = max(m.raw, formatArgBound(arg, 's', false))
+		m.other = max(m.other, formatArgBound(arg, 'x', false))
+	}
+	return m
+}
+
+func (m *formatArgMax) bound(verb rune, sharp bool) int64 {
+	if formatPrintsRaw(verb, sharp) {
+		return m.raw
+	}
+	return m.other
+}
+
+// formatPrintsRaw reports whether fmt prints a string as it is for verb: %s,
+// and %v without the '#' flag.
+func formatPrintsRaw(verb rune, sharp bool) bool {
+	return verb == 's' || verb == 'v' && !sharp
+}
+
+// parseFormatNum parses a number at format[start:end] like fmt's parsenum:
+// it checks for overflow before adding each digit, so it accepts up to
+// 10,000,009. On overflow it returns end, which skips the rest of the format,
+// and ok is false; ok is also false when there is no digit.
+func parseFormatNum(format string, start, end int) (n int, ok bool, newi int) {
+	if start >= end {
+		return 0, false, end
+	}
+	for newi = start; newi < end && '0' <= format[newi] && format[newi] <= '9'; newi++ {
+		if n > 1e6 {
+			return 0, false, end
+		}
+		n = n*10 + int(format[newi]-'0')
+		ok = true
+	}
+	return n, ok, newi
+}
+
+// skipFormatArgIndex skips an argument index such as [3] at format[i:] like
+// fmt's argNumber, and reports whether it parsed as a number, which fmt
+// reports even when the index is out of range. Without a closing bracket,
+// only the '[' is skipped.
+func skipFormatArgIndex(format string, i int) (int, bool) {
+	if i >= len(format) || format[i] != '[' {
+		return i, false
+	}
+	if len(format)-i < 3 {
+		return i + 1, false
+	}
+	for j := i + 1; j < len(format); j++ {
+		if format[j] == ']' {
+			_, ok, newi := parseFormatNum(format, i+1, j)
+			return j + 1, ok && newi == j
+		}
+	}
+	return i + 1, false
+}
+
+// formatArgBound returns an upper bound of how long fmt prints arg for verb,
+// not counting the width and precision. sharp is the '#' flag: %#v prints a
+// string in Go syntax, quoted and escaped like %q. It depends on verb and
+// sharp only through formatPrintsRaw.
+func formatArgBound(arg interface{}, verb rune, sharp bool) int64 {
+	switch v := arg.(type) {
+	case LString:
+		n := int64(len(v))
+		if formatPrintsRaw(verb, sharp) {
+			return n
+		}
+		// %q escapes a byte as \xNN, and "% #x" prints it as "0xNN ".
+		return 5*n + 2
+	case LNumber:
+		// %f of 1e308 has 309 digits before the precision.
+		return 400
+	default:
+		return formatOverhead
+	}
 }
 
 func strGsub(L *LState) int {
@@ -414,6 +671,11 @@ func strRep(L *LState) int {
 	if n < 0 {
 		L.Push(emptyLString)
 	} else {
+		// len(str) * n can overflow into a negative size, which used to
+		// lower the memory counter instead of raising.
+		if len(str) > 0 && n > math.MaxInt/len(str) {
+			L.RaiseError("resulting string too large")
+		}
 		L.TrackAlloc(int64(len(str) * n))
 		result := strings.Repeat(str, n)
 		L.Push(LString(result))

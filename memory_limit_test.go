@@ -2,6 +2,8 @@ package lua
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -200,7 +202,7 @@ func TestMemoryLimit_StringConcat(t *testing.T) {
 	`)
 
 	if err == nil {
-		t.Fatalf("Expected memory limit error, got nil: %d", L.allocatedBytes)
+		t.Fatalf("Expected memory limit error, got nil: %d", L.GetAllocatedBytes())
 	}
 
 	if !strings.Contains(err.Error(), "memory limit exceeded") {
@@ -875,5 +877,395 @@ func TestTryCreateTable_NoLimit(t *testing.T) {
 
 	if _, err := L.TryCreateTable(1024*1024, 0); err != nil {
 		t.Fatalf("Expected TryCreateTable to succeed when no limit is set, got: %v", err)
+	}
+}
+
+// Coroutines used to get a new state with no limit and their own counter, so
+// a script could allocate without bound inside one.
+func TestMemoryLimit_Coroutine(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		script string
+	}{
+		{"create and resume", `
+			local co = coroutine.create(function()
+				local t = {}
+				for i = 1, 100 do t[i] = string.rep("x", 100000) .. i end
+			end)
+			local ok, err = coroutine.resume(co)
+			assert(not ok)
+			error(err)
+		`},
+		{"wrap", `
+			local f = coroutine.wrap(function()
+				local t = {}
+				for i = 1, 100 do t[i] = string.rep("x", 100000) .. i end
+			end)
+			f()
+		`},
+		{"nested coroutines", `
+			local f = coroutine.wrap(function()
+				local g = coroutine.wrap(function()
+					local t = {}
+					for i = 1, 100 do t[i] = string.rep("x", 100000) .. i end
+				end)
+				g()
+			end)
+			f()
+		`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			L := NewState()
+			defer L.Close()
+			L.SetMemoryLimit(1024 * 1024)
+
+			err := L.DoString(tc.script)
+			if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+				t.Fatalf("expected a memory limit error, got %v", err)
+			}
+			if got := L.GetAllocatedBytes(); got > 2*1024*1024 {
+				t.Fatalf("allocated %d bytes under a 1 MB limit", got)
+			}
+		})
+	}
+}
+
+func TestMemoryLimit_CoroutineSharesCounter(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	before := L.GetAllocatedBytes()
+	err := L.DoString(`
+		local co = coroutine.create(function()
+			s = string.rep("x", 100000)
+		end)
+		assert(coroutine.resume(co))
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := L.GetAllocatedBytes() - before; got < 100000 {
+		t.Fatalf("a coroutine's allocation is not counted: %d bytes", got)
+	}
+}
+
+// len(str) * n overflowed into a negative size, which lowered the counter
+// to near math.MinInt64 and turned the limit off for the rest of the script.
+func TestMemoryLimit_StringRepeatOverflow(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetMemoryLimit(1024 * 1024)
+
+	err := L.DoString(`
+		local ok, err = pcall(string.rep, "aa", 2^62)
+		assert(not ok)
+		assert(string.find(err, "resulting string too large", 1, true), err)
+		local t = {}
+		for i = 1, 100 do t[i] = string.rep("x", 100000) .. i end
+	`)
+	if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+		t.Fatalf("expected a memory limit error, got %v", err)
+	}
+	if got := L.GetAllocatedBytes(); got < 0 || got > 2*1024*1024 {
+		t.Fatalf("allocated %d bytes under a 1 MB limit", got)
+	}
+}
+
+func TestMemoryLimit_TrackAllocNegative(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	L.Push(L.NewFunction(func(L *LState) int {
+		L.TrackAlloc(-1)
+		return 0
+	}))
+	err := L.PCall(0, 0, nil)
+	if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+		t.Fatalf("expected a memory limit error, got %v", err)
+	}
+}
+
+func TestMemoryLimit_TrackAllocSaturates(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	L.Push(L.NewFunction(func(L *LState) int {
+		L.TrackAlloc(math.MaxInt64)
+		L.TrackAlloc(math.MaxInt64)
+		return 0
+	}))
+	if err := L.PCall(0, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := L.GetAllocatedBytes(); got != math.MaxInt64 {
+		t.Fatalf("expected the counter to stop at MaxInt64, got %d", got)
+	}
+}
+
+// formatSizeBound must never be below what fmt prints, or the check before
+// formatting lets a larger result through.
+func TestFormatSizeBound_IsUpperBound(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	verbs := "svqxXdifeEgGcboOUtTp%!"
+	flags := "#0+- "
+	values := []LValue{
+		LString(""), LString("plain"), LString("\x00\x01\xff\xfe\a\n"),
+		LString("ünïcödé   🙂"), LString(strings.Repeat("\x80", 50)),
+		LString("12345"), LString("-1.5e10"),
+		// Long enough that the overhead per verb does not hide escaping:
+		// %#v and %q print each of these bytes as \x00 or \x80.
+		LString(strings.Repeat("\x00", 1024)), LString(strings.Repeat("\x80", 1024)),
+		LNumber(0), LNumber(-1), LNumber(1.5), LNumber(1e308), LNumber(-1e308),
+		LNumber(5e-324), LNumber(math.Inf(1)), LNumber(math.NaN()), LNumber(1 << 62),
+		LTrue, LFalse, LNil,
+	}
+	L := NewState()
+	defer L.Close()
+	values = append(values, formatArg(L.NewTable()), formatArg(L.NewFunction(func(*LState) int { return 0 })))
+
+	for range 20000 {
+		var b strings.Builder
+		for range rng.Intn(4) + 1 {
+			if rng.Intn(3) == 0 {
+				b.WriteString("lit")
+			}
+			b.WriteByte('%')
+			for range rng.Intn(3) {
+				b.WriteByte(flags[rng.Intn(len(flags))])
+			}
+			switch rng.Intn(6) {
+			case 0:
+				fmt.Fprintf(&b, "%d", rng.Intn(3000))
+			case 1:
+				b.WriteString("*")
+			case 2:
+				fmt.Fprintf(&b, "[%d]", rng.Intn(4))
+			}
+			if rng.Intn(3) == 0 {
+				fmt.Fprintf(&b, ".%d", rng.Intn(3000))
+			}
+			b.WriteByte(verbs[rng.Intn(len(verbs))])
+		}
+		format := b.String()
+		args := make([]interface{}, rng.Intn(5))
+		for i := range args {
+			args[i] = values[rng.Intn(len(values))]
+		}
+		got := len(fmt.Sprintf(format, args...))
+		if bound := formatSizeBound(format, args); int64(got) > bound {
+			t.Fatalf("format %q with %v: printed %d bytes, bound %d", format, args, got, bound)
+		}
+	}
+}
+
+// Formats built from random pieces are mostly malformed, like "%1*s" or
+// "%[2.*x", which fmt still prints: the bound must follow fmt's parser.
+func TestFormatSizeBound_MalformedFormats(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	pieces := []string{
+		"%", "%", "%", "#", "0", "+", "-", " ", "1", "7", "30", "*", ".", "[", "]",
+		"[1]", "[2]", "[0]", "[9]", "[x]", "s", "v", "q", "x", "d", "f", "c", "ü", "lit",
+	}
+	values := []LValue{
+		LString(""), LString("plain"), LString(strings.Repeat("\x00", 1024)),
+		LString(strings.Repeat("x", 1024)), LNumber(1), LNumber(-1e308), LTrue, LNil,
+	}
+	for range 200000 {
+		var b strings.Builder
+		for range rng.Intn(12) + 1 {
+			b.WriteString(pieces[rng.Intn(len(pieces))])
+		}
+		format := b.String()
+		args := make([]interface{}, rng.Intn(4))
+		for i := range args {
+			args[i] = values[rng.Intn(len(values))]
+		}
+		got := len(fmt.Sprintf(format, args...))
+		if bound := formatSizeBound(format, args); int64(got) > bound {
+			t.Fatalf("format %q with %d args: printed %d bytes, bound %d", format, len(args), got, bound)
+		}
+	}
+}
+
+func TestFormatSizeBound_Cases(t *testing.T) {
+	s := LString(strings.Repeat("x", 4096))
+	for _, c := range []struct {
+		format string
+		args   []interface{}
+	}{
+		// '*' after a width is the verb, and prints the argument.
+		{"%1*s", []interface{}{s}},
+		{"%1.2*s", []interface{}{s}},
+		// fmt accepts widths up to 10,000,009.
+		{"%9999999s", []interface{}{s}},
+		{"%10000009s", []interface{}{s}},
+		{"%.9999999s", []interface{}{s}},
+		// An overflowing width skips the rest of the format.
+		{"%100000000s|tail", []interface{}{s}},
+		// An index goes back to an argument that was used.
+		{"%s%[1]s%[1]q", []interface{}{s}},
+		{"%[1][2]s", []interface{}{s, s}},
+		{"%[99999999]s%s", []interface{}{s}},
+		{"%#v %#q %+q % #x", []interface{}{s, s, s, s}},
+		{"%5.", []interface{}{s}},
+		{"%ü", []interface{}{s}},
+	} {
+		got := len(fmt.Sprintf(c.format, c.args...))
+		if bound := formatSizeBound(c.format, c.args); int64(got) > bound {
+			t.Errorf("format %q: printed %d bytes, bound %d", c.format, got, bound)
+		}
+	}
+}
+
+func TestFormatSizeBound_Percent(t *testing.T) {
+	// "%%" prints one byte, and a '%' verb ignores the width and precision.
+	for _, c := range []struct {
+		format string
+		bound  int64
+	}{
+		{strings.Repeat("%%", 1000), 1000},
+		{"%5%", 1},
+		{"%-9999999.9999999%", 1},
+		{"a%%b", 3},
+	} {
+		if got := formatSizeBound(c.format, nil); got != c.bound {
+			t.Errorf("format %q: bound %d, want %d", c.format, got, c.bound)
+		}
+	}
+	// A '*' still prints %!(BADWIDTH) and uses the argument up.
+	args := []interface{}{LNumber(1)}
+	if got, bound := len(fmt.Sprintf("%*%", args...)), formatSizeBound("%*%", args); int64(got) > bound {
+		t.Errorf("%%*%%: printed %d bytes, bound %d", got, bound)
+	}
+}
+
+// A '[' in the text around the verbs is not an argument index. It used to
+// make every verb count the largest argument, as %x prints it: "[%s] %s"
+// with a 1 MB string was counted as 10 MB.
+func TestFormatSizeBound_LiteralBracket(t *testing.T) {
+	s := LString(strings.Repeat("x", 1<<20))
+	for _, c := range []struct {
+		format string
+		args   []interface{}
+	}{
+		{"[%s] %s", []interface{}{LString("info"), s}},
+		{"[%s] [%s] [%s] %s", []interface{}{LString("a"), LString("b"), LString("c"), s}},
+		{"%s[1]%s", []interface{}{LString("a"), s}},
+		{"%s]%s[", []interface{}{LString("a"), s}},
+	} {
+		got := int64(len(fmt.Sprintf(c.format, c.args...)))
+		bound := formatSizeBound(c.format, c.args)
+		if bound < got || bound > got+1024 {
+			t.Errorf("format %q: printed %d bytes, bound %d", c.format, got, bound)
+		}
+	}
+	// An index still makes each verb count the largest argument: %[2]s
+	// prints s again after the %s that used it.
+	args := []interface{}{LString("a"), s}
+	if bound := formatSizeBound("%s%s%[2]s", args); bound < 2*int64(len(s)) {
+		t.Errorf("bound %d is below the 2 MB that is printed", bound)
+	}
+}
+
+func TestMemoryLimit_StringFormatPercent(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetMemoryLimit(8 << 20)
+	// 2 MB of format for 1 MB of result. Counting 64 bytes for each "%%"
+	// failed it with an estimate of 66 MB.
+	if err := L.DoString(`assert(#string.format(string.rep("%%", 1000000)) == 1000000)`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMemoryLimit_StringFormatLiteralBracket(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetMemoryLimit(8 << 20)
+	// 2 MB of result. Counting each of the 4 verbs as the 2 MB string
+	// printed by %x failed it with an estimate of 40 MB.
+	err := L.DoString(`
+		local s = string.rep("x", 2 * 1024 * 1024)
+		assert(#string.format("[%s] %s %s %s", "info", "a", "b", s) == #s + 11)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMemoryLimit_StringFormatCheckedFirst(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetMemoryLimit(8 * 1024 * 1024)
+
+	for _, script := range []string{
+		// 2000 widths of 1 MB: 2 GB from one call.
+		`local args = {} for i = 1, 2000 do args[i] = "x" end
+		 return string.format(string.rep("%999999s", 2000), unpack(args))`,
+		// One 1 MB string used 100 times.
+		`local s = string.rep("x", 1024 * 1024) local args = {}
+		 for i = 1, 100 do args[i] = s end
+		 return string.format(string.rep("%s", 100), unpack(args))`,
+		// The same with one argument: %[1] prints it again for every verb.
+		`local s = string.rep("x", 1024 * 1024)
+		 return string.format(string.rep("%[1]s", 100), s)`,
+		// %#v quotes and escapes: each NUL byte prints as \x00.
+		`return string.format("%#v", string.rep("\0", 2 * 1024 * 1024))`,
+		// After a width, '*' is the verb: %!*(lua.LString=...) prints the
+		// 2 MB string, and the s after it is text.
+		`return string.format("%1*s", string.rep("x", 2 * 1024 * 1024))`,
+		// fmt applies widths up to 10,000,009.
+		`return string.format("%9999999s", "x")`,
+		// '*' uses up the 1 for the width, so %x prints the 3 MB string as
+		// 6 MB of hex. (string.format passes one argument per '%', so the
+		// second verb is needed to pass the string.)
+		`return string.format("%*x%s", 1, string.rep("a", 3 * 1024 * 1024))`,
+	} {
+		before := L.GetAllocatedBytes()
+		err := L.DoString(script)
+		if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+			t.Fatalf("expected a memory limit error, got %v", err)
+		}
+		// The format result was never counted: it was not built.
+		if got := L.GetAllocatedBytes() - before; got > 4*1024*1024 {
+			t.Fatalf("allocated %d bytes before failing", got)
+		}
+		L.ResetMemoryUsage()
+	}
+}
+
+func TestStringFormat_ReferenceValues(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	err := L.DoString(`
+		local t = {string.rep("secret", 10)}
+		assert(string.format("%s", t) == tostring(t))
+		assert(string.format("%v", print) == tostring(print))
+		-- fmt used to print the struct behind the table, strings included.
+		local d = string.format("%d", t)
+		assert(not string.find(d, "secret"), d)
+		assert(string.format("%5.1f|%-3d|%q", 1.25, 7, "a\\n") == '  1.2|7  |"a\\\\n"')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMemoryLimit_ConcatCountedFirst(t *testing.T) {
+	for _, script := range []string{
+		`local s = string.rep("x", 1024 * 1024) local t = {}
+		 for i = 1, 100 do t[i] = s end
+		 return table.concat(t)`,
+		`local s = string.rep("x", 1024 * 1024)
+		 return s .. s .. s .. s .. s .. s .. s .. s .. s .. s .. s .. s`,
+	} {
+		L := NewState()
+		L.SetMemoryLimit(8 * 1024 * 1024)
+		err := L.DoString(script)
+		if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+			t.Fatalf("expected a memory limit error, got %v", err)
+		}
+		L.Close()
 	}
 }
