@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMemoryLimit_TableAllocation(t *testing.T) {
@@ -1267,5 +1268,112 @@ func TestMemoryLimit_ConcatCountedFirst(t *testing.T) {
 			t.Fatalf("expected a memory limit error, got %v", err)
 		}
 		L.Close()
+	}
+}
+
+// gsub copied the whole string once per match: 200K matches took 6.4 s.
+func TestStringGsub_Linear(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	start := time.Now()
+	err := L.DoString(`
+		local s, n = string.gsub(string.rep("a", 1000000), "a", "bc")
+		assert(n == 1000000)
+		assert(#s == 2000000 and s == string.rep("bc", 1000000))
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("gsub of 1M matches took %v", elapsed)
+	}
+}
+
+func TestMemoryLimit_StringGsubCountedWhileBuilding(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetMemoryLimit(8 * 1024 * 1024)
+
+	// A 100 KB string where every byte becomes 1 KB: a 100 MB result.
+	err := L.DoString(`
+		local r = string.rep("y", 1024)
+		return string.gsub(string.rep("x", 100000), "x", r)
+	`)
+	if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+		t.Fatalf("expected a memory limit error, got %v", err)
+	}
+	if got := L.GetAllocatedBytes(); got > 16*1024*1024 {
+		t.Fatalf("allocated %d bytes under an 8 MB limit", got)
+	}
+}
+
+func TestStringGsub_Semantics(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+
+	err := L.DoString(`
+		local function check(want_s, want_n, s, n)
+			assert(s == want_s, s)
+			assert(n == want_n, tostring(n))
+		end
+		check("hello world", 0, string.gsub("hello world", "x", "y"))
+		check("-a-b-c-", 4, string.gsub("abc", "", "-"))
+		check("xbx", 2, string.gsub("aba", "a", "x"))
+		check("xba", 1, string.gsub("aba", "a", "x", 1))
+		check("[a]b[a]", 2, string.gsub("aba", "(a)", "[%1]"))
+		check("1b3", 2, string.gsub("aba", "()a", "%1"))
+		check("one b a", 1, string.gsub("a b a", "a", {a = "one"}, 1))
+		-- n counts matches, also the ones left unchanged.
+		check("A b A", 3, string.gsub("a b a", "%w+", {a = "A"}))
+		check("A b A", 3, string.gsub("a b a", "%w+", function(w) if w == "a" then return "A" end end))
+		check("hello", 1, string.gsub("hello", "^h", "h"))
+
+		-- An error in the replacement function reaches pcall unchanged.
+		local ok, err = pcall(string.gsub, "abc", "b", function() error("boom") end)
+		assert(not ok and string.find(err, "boom", 1, true), err)
+		local ok, err = pcall(string.gsub, "abc", "b", "%2")
+		assert(not ok and string.find(err, "invalid capture index", 1, true), err)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMemoryLimit_StringGsubReplacementCountedWhileBuilding(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	L.SetMemoryLimit(1 << 20)
+
+	// One match of 64 KB, copied 500 times by the replacement: 32 MB used
+	// to be built for the match before any of it was counted.
+	err := L.DoString(`return string.gsub(string.rep("x", 64 * 1024), ".+", string.rep("%0", 500))`)
+	if err == nil || !strings.Contains(err.Error(), "memory limit exceeded") {
+		t.Fatalf("expected the memory limit error, got %v", err)
+	}
+	if got := L.GetAllocatedBytes(); got > 2<<20 {
+		t.Fatalf("counted %d bytes before failing", got)
+	}
+}
+
+func TestStringGsub_ReplacementString(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	err := L.DoString(`
+		local function check(want, got) assert(got == want, got) end
+		check("<b=a>", (string.gsub("ab", "(a)(b)", "<%2=%1>")))
+		check("[ab][ab]", (string.gsub("ab", "ab", "[%0][%0]")))
+		check("[ab]", (string.gsub("ab", "ab", "[%1]")))
+		check("2", (string.gsub("ab", "a()b", "%1")))
+		check("%", (string.gsub("ab", "ab", "%%")))
+		check("%1", (string.gsub("ab", "(ab)", "%%1")))
+		check("%ab", (string.gsub("ab", "(ab)", "%%%1")))
+		-- A '%' before another byte, or at the end, stays as it is.
+		check("%x-%", (string.gsub("ab", "ab", "%x-%")))
+		local ok, err = pcall(string.gsub, "ab", "(a)", "%2")
+		assert(not ok and err:find("invalid capture index"), err)
+	`)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

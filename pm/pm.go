@@ -663,6 +663,21 @@ func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err er
 // Backtracking on some patterns takes exponential time, so callers that run
 // untrusted patterns should pass a context with a deadline. ctx may be nil.
 func FindContext(ctx context.Context, p string, src []byte, offset, limit int) (matches []*MatchData, err error) {
+	matches = []*MatchData{}
+	err = FindEachContext(ctx, p, src, offset, limit, func(md *MatchData) bool {
+		matches = append(matches, md)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+// FindEachContext is like FindContext, but calls fn with each match as it is
+// found instead of returning them all, and stops early when fn returns false.
+// A panic in fn is not recovered.
+func FindEachContext(ctx context.Context, p string, src []byte, offset, limit int, fn func(*MatchData) bool) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
 			switch perr := v.(type) {
@@ -670,6 +685,8 @@ func FindContext(ctx context.Context, p string, src []byte, offset, limit int) (
 				err = perr
 			case ctxDone:
 				err = perr.err
+			case foreignPanic:
+				panic(perr.v)
 			default:
 				panic(v)
 			}
@@ -677,12 +694,12 @@ func FindContext(ctx context.Context, p string, src []byte, offset, limit int) (
 	}()
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	pat := parsePattern(newScanner([]byte(p)), true)
 	vm := &matcher{src: src, insts: compilePattern(pat), ctx: ctx}
-	matches = []*MatchData{}
+	n := 0
 	for sp := offset; sp <= len(src); {
 		ok, nsp, ms := vm.recursiveVM(0, sp, 0, newMatchState())
 		sp++
@@ -690,13 +707,34 @@ func FindContext(ctx context.Context, p string, src []byte, offset, limit int) (
 			if sp < nsp {
 				sp = nsp
 			}
-			matches = append(matches, ms)
+			n++
+			if !callMatchFunc(fn, ms) {
+				break
+			}
 		}
-		if len(matches) == limit || pat.MustHead {
+		if n == limit || pat.MustHead {
 			break
 		}
 	}
 	return
 }
+
+// callMatchFunc calls fn outside FindEachContext's recover: a panic in fn
+// must reach fn's caller as it is, even if it is a *Error or ctxDone.
+func callMatchFunc(fn func(*MatchData) bool, md *MatchData) (ok bool) {
+	panicked := true
+	defer func() {
+		if panicked {
+			panic(foreignPanic{recover()})
+		}
+	}()
+	ok = fn(md)
+	panicked = false
+	return ok
+}
+
+// foreignPanic carries a panic from a FindEachContext callback through its
+// recover.
+type foreignPanic struct{ v interface{} }
 
 /* }}} */

@@ -408,6 +408,10 @@ func formatArgBound(arg interface{}, verb rune, sharp bool) int64 {
 	}
 }
 
+// gsubCheckInterval is how many matches gsub replaces between two context
+// checks. Matching checks the context itself, but replacing does not.
+const gsubCheckInterval = 1024
+
 func strGsub(L *LState) int {
 	str := L.CheckString(1)
 	pat := L.CheckString(2)
@@ -415,33 +419,58 @@ func strGsub(L *LState) int {
 	repl := L.CheckAny(3)
 	limit := L.OptInt(4, -1)
 
-	mds, err := pm.FindContext(L.ctx, pat, unsafeFastStringToReadOnlyBytes(str), 0, limit)
+	// Build the result in one pass, while matching, and count it as it
+	// grows. Collecting the matches first held one MatchData per match,
+	// and replacing them one by one copied the whole string per match.
+	var b strings.Builder
+	last := 0
+	n := 0
+	appendPart := func(part string) {
+		L.TrackAlloc(int64(len(part)))
+		b.WriteString(part)
+	}
+	err := pm.FindEachContext(L.ctx, pat, unsafeFastStringToReadOnlyBytes(str), 0, limit, func(match *pm.MatchData) bool {
+		n++
+		if n%gsubCheckInterval == 0 && L.ctx != nil {
+			if err := L.ctx.Err(); err != nil {
+				L.RaiseError(err.Error())
+			}
+		}
+		start, end := match.Capture(0), match.Capture(1)
+		var replacement string
+		var ok bool
+		switch lv := repl.(type) {
+		case LString:
+			appendPart(str[last:start])
+			strGsubStr(L, str, string(lv), match, appendPart)
+			last = end
+			return true
+		case *LTable:
+			replacement, ok = strGsubTable(L, str, lv, match)
+		case *LFunction:
+			replacement, ok = strGsubFunc(L, str, lv, match)
+		}
+		appendPart(str[last:start])
+		if ok {
+			appendPart(replacement)
+		} else {
+			appendPart(str[start:end])
+		}
+		last = end
+		return true
+	})
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
-	if len(mds) == 0 {
+	if n == 0 {
 		L.SetTop(1)
 		L.Push(LNumber(0))
 		return 2
 	}
-	var result string
-	switch lv := repl.(type) {
-	case LString:
-		result = strGsubStr(L, str, string(lv), mds)
-	case *LTable:
-		result = strGsubTable(L, str, lv, mds)
-	case *LFunction:
-		result = strGsubFunc(L, str, lv, mds)
-	}
-	L.TrackAlloc(int64(len(result)))
-	L.Push(LString(result))
-	L.Push(LNumber(len(mds)))
+	appendPart(str[last:])
+	L.Push(LString(b.String()))
+	L.Push(LNumber(n))
 	return 2
-}
-
-type replaceInfo struct {
-	Indicies []int
-	String   string
 }
 
 func checkCaptureIndex(L *LState, m *pm.MatchData, idx int) {
@@ -466,96 +495,75 @@ func capturedString(L *LState, m *pm.MatchData, str string, idx int) string {
 
 }
 
-func strGsubDoReplace(str string, info []replaceInfo) string {
-	offset := 0
-	buf := []byte(str)
-	for _, replace := range info {
-		oldlen := len(buf)
-		b1 := append([]byte(""), buf[0:offset+replace.Indicies[0]]...)
-		b2 := []byte("")
-		index2 := offset + replace.Indicies[1]
-		if index2 <= len(buf) {
-			b2 = append(b2, buf[index2:len(buf)]...)
+// strGsubStr writes repl, with %0-%9 replaced by the captures of match, to
+// appendPart one piece at a time, so each piece is counted before it is
+// written. Building the whole replacement first let one match grow without a
+// limit: string.rep("%0", 5000) repeats a 1 MB match into 5 GB.
+//
+// "%%" is "%", and a '%' before any other byte, or at the end, stays as it is.
+func strGsubStr(L *LState, str string, repl string, match *pm.MatchData, appendPart func(string)) {
+	last := 0 // where the text not written yet starts
+	for i := 0; i < len(repl)-1; i++ {
+		if repl[i] != '%' {
+			continue
 		}
-		buf = append(b1, replace.String...)
-		buf = append(buf, b2...)
-		offset += len(buf) - oldlen
+		switch c := repl[i+1]; {
+		case c == '%':
+			appendPart(repl[last : i+1])
+			last = i + 2
+		case c >= '0' && c <= '9':
+			appendPart(repl[last:i])
+			appendPart(capturedString(L, match, str, 2*int(c-'0')))
+			last = i + 2
+		}
+		i++
 	}
-	return string(buf)
+	appendPart(repl[last:])
 }
 
-func strGsubStr(L *LState, str string, repl string, matches []*pm.MatchData) string {
-	infoList := make([]replaceInfo, 0, len(matches))
-	for _, match := range matches {
-		start, end := match.Capture(0), match.Capture(1)
-		sc := newFlagScanner('%', "", "", repl)
-		for c, eos := sc.Next(); !eos; c, eos = sc.Next() {
-			if !sc.ChangeFlag {
-				if sc.HasFlag {
-					if c >= '0' && c <= '9' {
-						sc.AppendString(capturedString(L, match, str, 2*(int(c)-48)))
-					} else {
-						sc.AppendChar('%')
-						sc.AppendChar(c)
-					}
-					sc.HasFlag = false
-				} else {
-					sc.AppendChar(c)
-				}
+// strGsubTable returns the value repl holds for the first capture of match,
+// and false when it is false or nil.
+func strGsubTable(L *LState, str string, repl *LTable, match *pm.MatchData) (string, bool) {
+	idx := 0
+	if match.CaptureLength() > 2 { // has captures
+		idx = 2
+	}
+	var value LValue
+	if match.IsPosCapture(idx) {
+		value = L.GetTable(repl, LNumber(match.Capture(idx)))
+	} else {
+		value = L.GetField(repl, str[match.Capture(idx):match.Capture(idx+1)])
+	}
+	if LVIsFalse(value) {
+		return "", false
+	}
+	return LVAsString(value), true
+}
+
+// strGsubFunc returns what repl returns for the captures of match, and false
+// when it returns false or nil.
+func strGsubFunc(L *LState, str string, repl *LFunction, match *pm.MatchData) (string, bool) {
+	L.Push(repl)
+	nargs := 0
+	if match.CaptureLength() > 2 { // has captures
+		for i := 2; i < match.CaptureLength(); i += 2 {
+			if match.IsPosCapture(i) {
+				L.Push(LNumber(match.Capture(i)))
+			} else {
+				L.Push(LString(capturedString(L, match, str, i)))
 			}
-		}
-		infoList = append(infoList, replaceInfo{[]int{start, end}, sc.String()})
-	}
-
-	return strGsubDoReplace(str, infoList)
-}
-
-func strGsubTable(L *LState, str string, repl *LTable, matches []*pm.MatchData) string {
-	infoList := make([]replaceInfo, 0, len(matches))
-	for _, match := range matches {
-		idx := 0
-		if match.CaptureLength() > 2 { // has captures
-			idx = 2
-		}
-		var value LValue
-		if match.IsPosCapture(idx) {
-			value = L.GetTable(repl, LNumber(match.Capture(idx)))
-		} else {
-			value = L.GetField(repl, str[match.Capture(idx):match.Capture(idx+1)])
-		}
-		if !LVIsFalse(value) {
-			infoList = append(infoList, replaceInfo{[]int{match.Capture(0), match.Capture(1)}, LVAsString(value)})
-		}
-	}
-	return strGsubDoReplace(str, infoList)
-}
-
-func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData) string {
-	infoList := make([]replaceInfo, 0, len(matches))
-	for _, match := range matches {
-		start, end := match.Capture(0), match.Capture(1)
-		L.Push(repl)
-		nargs := 0
-		if match.CaptureLength() > 2 { // has captures
-			for i := 2; i < match.CaptureLength(); i += 2 {
-				if match.IsPosCapture(i) {
-					L.Push(LNumber(match.Capture(i)))
-				} else {
-					L.Push(LString(capturedString(L, match, str, i)))
-				}
-				nargs++
-			}
-		} else {
-			L.Push(LString(capturedString(L, match, str, 0)))
 			nargs++
 		}
-		L.Call(nargs, 1)
-		ret := L.reg.Pop()
-		if !LVIsFalse(ret) {
-			infoList = append(infoList, replaceInfo{[]int{start, end}, LVAsString(ret)})
-		}
+	} else {
+		L.Push(LString(capturedString(L, match, str, 0)))
+		nargs++
 	}
-	return strGsubDoReplace(str, infoList)
+	L.Call(nargs, 1)
+	ret := L.reg.Pop()
+	if LVIsFalse(ret) {
+		return "", false
+	}
+	return LVAsString(ret), true
 }
 
 type strMatchData struct {
